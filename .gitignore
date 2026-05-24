@@ -5,19 +5,13 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+*.so
+
+# Virtual environments
 venv/
 .venv/
-.env
-.env.local
-.env.*
-
-# Logs
-*.log
-
-# Coverage
-.coverage
-coverage/
-htmlcov/
+env/
+ENV/
 
 # IDE
 .vscode/
@@ -25,16 +19,24 @@ htmlcov/
 *.swp
 *.swo
 
+# Logs
+*.log
+
 # OS
 .DS_Store
 Thumbs.db
 
-# Build
-build/
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Distribution
 dist/
+build/
 *.egg-info/
 
-# Testing
-.pytest_cache/
-.mypy_cache/
+# Temp files
+*.tmp
+*.temp
 ```
