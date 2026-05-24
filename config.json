@@ -1,21 +1,25 @@
 {
   "categories": {
-    "images": ["jpg", "jpeg", "png", "gif", "bmp", "svg", "webp", "ico"],
-    "documents": ["pdf", "doc", "docx", "txt", "rtf", "odt", "xls", "xlsx", "ppt", "pptx", "md"],
-    "videos": ["mp4", "avi", "mkv", "mov", "wmv", "flv", "webm"],
-    "audio": ["mp3", "wav", "flac", "aac", "ogg", "wma", "m4a"],
-    "archives": ["zip", "rar", "7z", "tar", "gz", "bz2"],
-    "code": ["py", "js", "html", "css", "java", "c", "cpp", "h", "php", "rb", "go", "rs", "sh", "json", "xml", "yaml", "yml"],
-    "installers": ["exe", "msi", "dmg", "pkg", "deb", "rpm", "apk"],
-    "torrents": ["torrent", "magnet"],
-    "fonts": ["ttf", "otf", "woff", "woff2"],
-    "other": []
+    "images":     ["jpg", "jpeg", "png", "gif", "bmp", "svg", "webp", "ico", "tiff", "raw", "heic", "heif"],
+    "documents":  ["pdf", "doc", "docx", "txt", "rtf", "odt", "xls", "xlsx", "ppt", "pptx", "md", "csv", "epub"],
+    "videos":     ["mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v", "3gp"],
+    "audio":      ["mp3", "wav", "flac", "aac", "ogg", "wma", "m4a", "opus"],
+    "archives":   ["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst"],
+    "code":       ["py", "js", "ts", "html", "css", "java", "cpp", "c", "h", "go",
+                   "rs", "rb", "php", "sql", "json", "xml", "yaml", "yml", "sh",
+                   "bat", "ps1", "kt", "swift", "dart"],
+    "installers": ["exe", "msi", "deb", "rpm", "pkg", "dmg", "appimage", "apk"],
+    "torrents":   ["torrent"],
+    "fonts":      ["ttf", "otf", "woff", "woff2", "eot"],
+    "other":      []
   },
   "settings": {
-    "dry_run": false,
-    "recursive": true,
-    "clean_empty_dirs": true,
-    "ignore_hidden": true,
-    "log_file": "actions.log"
+    "dry_run":            false,
+    "recursive":          true,
+    "clean_empty_dirs":   true,
+    "ignore_hidden":      true,
+    "log_file":           "actions.log",
+    "duplicate_strategy": "rename",
+    "use_watchdog":       true
   }
 }
