@@ -11,6 +11,7 @@
 - progress_callback(current, total) для GUI
 - Стратегии дублей: rename / skip / replace
 - Глубокое слияние конфигов
+- Исправлен баг с undo: пути в логе теперь относительные
 
 Исправления безопасности (12 уязвимостей):
 - Path Traversal: проверка, что пути внутри source_dir
@@ -30,6 +31,7 @@
 import copy
 import hashlib
 import json
+import logging
 import os
 import shutil
 import threading
@@ -37,6 +39,19 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
+
+# ── Настройка логирования ───────────────────────────────────────────────────────
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 # ── Константы ──────────────────────────────────────────────────────────────────
 
@@ -116,7 +131,7 @@ def load_config() -> Dict[str, Any]:
                     merged[key] = val
             return merged
         except (json.JSONDecodeError, IOError) as exc:
-            print(f"⚠ Ошибка чтения config.json: {exc}. Используются дефолтные настройки.")
+            logger.warning(f"Ошибка чтения config.json: {exc}. Используются дефолтные настройки.")
     else:
         save_config(DEFAULT_CONFIG)
     return copy.deepcopy(DEFAULT_CONFIG)
@@ -128,7 +143,7 @@ def save_config(config: Dict[str, Any]) -> None:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
     except IOError as exc:
-        print(f"⚠ Не удалось сохранить config.json: {exc}")
+        logger.warning(f"Не удалось сохранить config.json: {exc}")
 
 
 # ── Вспомогательные функции ────────────────────────────────────────────────────
@@ -256,7 +271,7 @@ def _save_undo_log(source_dir: Path, entries: List[Dict]) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(entries, f, indent=2, ensure_ascii=False)
     except IOError as exc:
-        print(f"⚠ Не удалось сохранить лог отмены: {exc}")
+        logger.warning(f"Не удалось сохранить лог отмены: {exc}")
 
 
 def _append_undo_log(source_dir: Path, new_entries: List[Dict]) -> None:
@@ -440,16 +455,25 @@ def organize_files(
 
                 shutil.move(str(file_path), str(target_path))
 
-            # Логируем с маскировкой пути
+            # Логируем с маскировкой пути для отображения, но относительными путями для отмены
             masked_rel = _mask_path_for_log(file_path, source_path)
             masked_target_rel = _mask_path_for_log(target_path, source_path)
             log(f"  ✓  {masked_rel}  ➜  {category}/{target_path.name}")
 
+            # Сохраняем относительные пути для корректной отмены
+            try:
+                rel_source = str(file_path.relative_to(source_path))
+                rel_dest = str(target_path.relative_to(source_path))
+            except ValueError:
+                # Фоллбэк на имена файлов, если relative_to не работает
+                rel_source = file_path.name
+                rel_dest = target_path.name
+
             session_log.append({
                 "timestamp":     datetime.now().isoformat(),
                 "action":        "move",
-                "source":        str(file_path.name),  # Только имя, не полный путь
-                "destination":   str(target_path.name),  # Только имя
+                "source":        rel_source,  # Относительный путь для отмены
+                "destination":   rel_dest,    # Относительный путь для отмены
                 "original_name": file_path.name,
             })
             stats["moved"] += 1
@@ -568,8 +592,9 @@ def undo_last_operation(
         if entry.get("action") != "move":
             continue
 
-        dest = Path(entry["destination"])
-        src = Path(entry["source"])
+        # Пути в логе теперь относительные, поэтому добавляем source_dir
+        dest = source_path / entry["destination"]
+        src = source_path / entry["source"]
 
         if not dest.exists():
             log(f"  ⚠  Файл не найден: {dest.name}")
