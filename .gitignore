@@ -5,38 +5,51 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
-*.so
-
-# Virtual environments
+env/
 venv/
 .venv/
-env/
-ENV/
+.ENV
+.venv.bak/
+pip-log.txt
+pip-selfcheck.json
+.python-version
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage/
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# Logs
-*.log
+*.tmp
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# Distribution
-dist/
-build/
-*.egg-info/
-
-# Temp files
-*.tmp
-*.temp
+# Environment
+.env
+.env.local
+*.env*
+.env.*
 ```
