@@ -2,99 +2,129 @@
 """
 Консольная версия умного органайзера файлов.
 Использует organizer_core для логики.
-Поддерживает конфигурацию, отмену действий и мониторинг.
 """
 
 import argparse
 import sys
 from pathlib import Path
+
 from organizer_core import (
+    get_undo_count,
+    load_config,
     organize_files,
-    undo_last_operation,
     start_monitoring,
     stop_monitoring,
-    load_config
+    undo_last_operation,
 )
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Умный органайзер файлов - автоматическая сортировка по типам",
+        description="Умный органайзер файлов — автоматическая сортировка по типам",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Примеры использования:
-  python file_organizer.py /path/to/folder                     # Обычная сортировка
-  python file_organizer.py /path/to/folder --dry-run           # Тестовый режим
-  python file_organizer.py /path/to/folder --undo              # Отменить последнюю операцию
-  python file_organizer.py /path/to/folder --monitor           # Режим мониторинга
-  python file_organizer.py /path/to/folder --no-recursive      # Только корневая папка
-        """
+Примеры:
+  python file_organizer.py ~/Downloads              # Сортировка
+  python file_organizer.py ~/Downloads --dry-run    # Тестовый прогон
+  python file_organizer.py ~/Downloads --undo       # Отменить все перемещения
+  python file_organizer.py ~/Downloads --undo-count 5  # Отменить последние 5
+  python file_organizer.py ~/Downloads --monitor    # Мониторинг новых файлов
+  python file_organizer.py ~/Downloads --no-recursive  # Только корень папки
+        """,
     )
 
-    parser.add_argument("directory", nargs="?", default=".",
-                        help="Директория для организации (по умолчанию: текущая)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Режим просмотра: показать что будет сделано, без реальных действий")
-    parser.add_argument("--no-recursive", action="store_true",
-                        help="Не обрабатывать подпапки рекурсивно")
-    parser.add_argument("--quiet", "-q", action="store_true",
-                        help="Тихий режим: минимальный вывод")
-    parser.add_argument("--undo", action="store_true",
-                        help="Отменить последнюю операцию перемещения")
-    parser.add_argument("--undo-count", type=int, default=-1,
-                        help="Количество операций для отмены (по умолчанию: все)")
-    parser.add_argument("--monitor", action="store_true",
-                        help="Режим мониторинга: автоматическая сортировка новых файлов")
-    parser.add_argument("--interval", type=int, default=10,
-                        help="Интервал мониторинга в секундах (по умолчанию: 10)")
-    parser.add_argument("--config", type=str,
-                        help="Путь к файлу конфигурации (по умолчанию: config.json рядом со скриптом)")
+    parser.add_argument(
+        "directory", nargs="?", default=".",
+        help="Директория для организации (по умолчанию: текущая)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Показать план без реальных действий",
+    )
+    parser.add_argument(
+        "--no-recursive", action="store_true",
+        help="Обрабатывать только файлы в корне папки",
+    )
+    parser.add_argument(
+        "--quiet", "-q", action="store_true",
+        help="Минимальный вывод",
+    )
+    parser.add_argument(
+        "--undo", action="store_true",
+        help="Отменить перемещения (читает персистентный лог — работает после перезапуска)",
+    )
+    parser.add_argument(
+        "--undo-count", type=int, default=-1, metavar="N",
+        help="Сколько последних операций отменить (-1 = все)",
+    )
+    parser.add_argument(
+        "--monitor", action="store_true",
+        help="Мониторинг: автосортировка при появлении новых файлов",
+    )
+    parser.add_argument(
+        "--interval", type=int, default=10, metavar="SEC",
+        help="Интервал polling-мониторинга в секундах (по умолчанию: 10)",
+    )
+    parser.add_argument(
+        "--config", type=str, metavar="PATH",
+        help="Путь к config.json (по умолчанию: рядом со скриптом)",
+    )
+    parser.add_argument(
+        "--undo-info", action="store_true",
+        help="Показать количество доступных для отмены операций",
+    )
 
     args = parser.parse_args()
-
     target_dir = Path(args.directory).resolve()
 
     if not target_dir.exists():
-        print(f"❌ Ошибка: Директория не найдена: {target_dir}")
+        print(f"❌ Директория не найдена: {target_dir}")
         sys.exit(1)
 
-    # Загрузка конфигурации
     config = load_config()
 
-    # Обработка режима отмены
+    # Информация об undo
+    if args.undo_info:
+        n = get_undo_count(str(target_dir))
+        print(f"Доступно операций для отмены: {n}")
+        return
+
+    # Режим отмены
     if args.undo:
         undo_last_operation(
             str(target_dir),
             count=args.undo_count,
-            verbose=not args.quiet
+            verbose=not args.quiet,
         )
         return
 
-    # Обработка режима мониторинга
+    # Режим мониторинга
     if args.monitor:
-        print(f"🚀 Запуск мониторинга директории: {target_dir}")
-        print(f"⏱ Интервал проверки: {args.interval} сек.")
-        print("Нажмите Ctrl+C для остановки...\n")
+        print(f"🚀 Запуск мониторинга: {target_dir}")
+        print(f"⏱  Интервал: {args.interval} с.  Ctrl+C для остановки.\n")
 
-        def log_callback(msg):
+        def _cb(msg: str) -> None:
             if not args.quiet:
                 print(msg)
 
         try:
-            thread = start_monitoring(str(target_dir), interval=args.interval, callback=log_callback)
+            thread = start_monitoring(
+                str(target_dir),
+                interval=args.interval,
+                callback=_cb,
+                config=config,
+            )
             while thread.is_alive():
                 thread.join(timeout=1)
         except KeyboardInterrupt:
-            print("\n⏹ Остановка мониторинга...")
+            print("\n⏹  Остановка мониторинга...")
             stop_monitoring()
-            print("✅ Мониторинг остановлен.")
+            print("✅ Готово.")
         return
 
-    # Обычный режим сортировки
-    recursive = not args.no_recursive
-
-    if args.dry_run and config and "settings" in config:
-        config["settings"]["dry_run"] = True
+    # Обычная сортировка
+    # recursive: None = берётся из конфига; False = явно передаём False
+    recursive: bool | None = False if args.no_recursive else None
 
     try:
         organize_files(
@@ -102,10 +132,10 @@ def main():
             dry_run=args.dry_run,
             verbose=not args.quiet,
             recursive=recursive,
-            config=config
+            config=config,
         )
-    except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
+    except Exception as exc:
+        print(f"❌ Критическая ошибка: {exc}")
         sys.exit(1)
 
 
