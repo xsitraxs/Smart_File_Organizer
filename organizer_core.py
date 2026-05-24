@@ -1,455 +1,601 @@
 #!/usr/bin/env python3
 """
-Ядро умного органайзера файлов
-Модуль содержит основную логику сортировки файлов по типам.
-Импортируется в CLI и GUI версии.
-Поддерживает конфигурацию через config.json, отмену действий и мониторинг.
+Ядро умного органайзера файлов — улучшенная версия.
+
+Исправлено:
+- Персистентный лог отмены (работает после перезапуска)
+- Потокобезопасность (threading.Lock)
+- Логика recursive больше не инвертирована
+- Мониторинг не сбрасывает лог отмены
+- Поддержка watchdog (с polling-фоллбэком)
+- progress_callback(current, total) для GUI
+- Стратегии дублей: rename / skip / replace
+- Глубокое слияние конфигов
 """
 
+import copy
+import hashlib
+import json
 import os
 import shutil
-import json
-import time
 import threading
-from pathlib import Path
+import time
 from datetime import datetime
-from typing import Optional, Callable, Dict, Any
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
-# Путь к конфигурации
+# ── Константы ──────────────────────────────────────────────────────────────────
+
 CONFIG_FILE = Path(__file__).parent / "config.json"
-DEFAULT_CONFIG = {
+UNDO_LOG_FILENAME = ".organizer_undo.json"
+
+SCRIPT_FILES = frozenset({
+    "organizer_core.py",
+    "file_organizer.py",
+    "file_organizer_gui.py",
+    "config.json",
+    "actions.log",
+    UNDO_LOG_FILENAME,
+    "__pycache__",
+})
+
+DEFAULT_CONFIG: Dict[str, Any] = {
     "categories": {
-        "images": ["jpg", "jpeg", "png", "gif", "bmp", "svg", "webp", "ico", "tiff", "raw"],
-        "documents": ["pdf", "doc", "docx", "txt", "rtf", "odt", "xls", "xlsx", "ppt", "pptx", "md"],
-        "videos": ["mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v"],
-        "audio": ["mp3", "wav", "flac", "aac", "ogg", "wma", "m4a"],
-        "archives": ["zip", "rar", "7z", "tar", "gz", "bz2", "xz"],
-        "torrents": ["torrent", "magnet"],
-        "code": ["py", "js", "ts", "html", "css", "java", "cpp", "c", "h", "go", "rs", "rb", "php", "sql", "json", "xml", "yaml", "yml"],
+        "images":     ["jpg", "jpeg", "png", "gif", "bmp", "svg", "webp", "ico", "tiff", "raw", "heic", "heif"],
+        "documents":  ["pdf", "doc", "docx", "txt", "rtf", "odt", "xls", "xlsx", "ppt", "pptx", "md", "csv", "epub"],
+        "videos":     ["mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v", "3gp"],
+        "audio":      ["mp3", "wav", "flac", "aac", "ogg", "wma", "m4a", "opus"],
+        "archives":   ["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst"],
+        "code":       ["py", "js", "ts", "html", "css", "java", "cpp", "c", "h", "go",
+                       "rs", "rb", "php", "sql", "json", "xml", "yaml", "yml", "sh",
+                       "bat", "ps1", "kt", "swift", "dart"],
         "installers": ["exe", "msi", "deb", "rpm", "pkg", "dmg", "appimage", "apk"],
-        "fonts": ["ttf", "otf", "woff", "woff2", "eot"],
-        "other": []
+        "torrents":   ["torrent"],
+        "fonts":      ["ttf", "otf", "woff", "woff2", "eot"],
+        "other":      [],
     },
     "settings": {
-        "dry_run": False,
-        "recursive": True,
-        "clean_empty_dirs": True,
-        "ignore_hidden": True,
-        "log_file": "actions.log"
-    }
+        "dry_run":            False,
+        "recursive":          True,
+        "clean_empty_dirs":   True,
+        "ignore_hidden":      True,
+        "log_file":           "actions.log",
+        "duplicate_strategy": "rename",   # rename | skip | replace
+        "use_watchdog":       True,
+    },
 }
 
-# Глобальные переменные
-FILE_CATEGORIES = {}
-EXTENSION_TO_CATEGORY = {}
-ACTION_LOG = []  # Список действий для отмены
-MONITORING_STOP_EVENT = threading.Event()
+# ── Глобальное состояние (потокобезопасное) ────────────────────────────────────
 
+_lock = threading.Lock()
+_action_log: List[Dict] = []           # in-memory лог текущей сессии
+_monitoring_stop_event = threading.Event()
+
+
+# ── Конфигурация ───────────────────────────────────────────────────────────────
 
 def load_config() -> Dict[str, Any]:
-    """Загружает конфигурацию из файла или использует значения по умолчанию."""
+    """Загружает конфиг с глубоким слиянием с дефолтными значениями."""
     if CONFIG_FILE.exists():
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                # Объединяем с дефолтными значениями на случай отсутствия ключей
-                for key in DEFAULT_CONFIG:
-                    if key not in config:
-                        config[key] = DEFAULT_CONFIG[key]
-                return config
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"⚠ Ошибка чтения config.json: {e}. Используются настройки по умолчанию.")
-            return DEFAULT_CONFIG.copy()
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                user = json.load(f)
+            merged = copy.deepcopy(DEFAULT_CONFIG)
+            for key, val in user.items():
+                if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
+                    merged[key].update(val)
+                else:
+                    merged[key] = val
+            return merged
+        except (json.JSONDecodeError, IOError) as exc:
+            print(f"⚠ Ошибка чтения config.json: {exc}. Используются дефолтные настройки.")
     else:
-        # Создаем файл конфигурации по умолчанию, если его нет
         save_config(DEFAULT_CONFIG)
-        return DEFAULT_CONFIG.copy()
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
-def save_config(config: Dict[str, Any]):
-    """Сохраняет конфигурацию в файл."""
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+def save_config(config: Dict[str, Any]) -> None:
+    """Сохраняет конфиг в файл."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+    except IOError as exc:
+        print(f"⚠ Не удалось сохранить config.json: {exc}")
 
 
-def init_categories(config: Optional[Dict[str, Any]] = None):
-    """Инициализирует маппинг расширений на основе конфигурации."""
-    global FILE_CATEGORIES, EXTENSION_TO_CATEGORY
+# ── Вспомогательные функции ────────────────────────────────────────────────────
 
+def _build_ext_map(config: Dict[str, Any]) -> Dict[str, str]:
+    """Строит маппинг «.расширение → категория»."""
+    ext_map: Dict[str, str] = {}
+    for cat, exts in config.get("categories", {}).items():
+        for ext in exts:
+            ext_map[f".{ext.lower()}"] = cat
+    return ext_map
+
+
+def _get_category(file_path: Path, ext_map: Dict[str, str]) -> str:
+    return ext_map.get(file_path.suffix.lower(), "other")
+
+
+def _get_unique_path(target_dir: Path, filename: str) -> Path:
+    """Возвращает путь без конфликта имён, добавляя _1, _2, …"""
+    target = target_dir / filename
+    if not target.exists():
+        return target
+    stem, suffix = Path(filename).stem, Path(filename).suffix
+    for i in range(1, 100_000):
+        candidate = target_dir / f"{stem}_{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"Не удалось найти уникальное имя для {filename}")
+
+
+def _file_md5(path: Path, chunk: int = 65536) -> Optional[str]:
+    """MD5-хеш файла для обнаружения полных дублей по содержимому."""
+    try:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            while data := f.read(chunk):
+                h.update(data)
+        return h.hexdigest()
+    except IOError:
+        return None
+
+
+# ── Персистентный лог отмены ───────────────────────────────────────────────────
+
+def _undo_log_path(source_dir: Path) -> Path:
+    return source_dir / UNDO_LOG_FILENAME
+
+
+def _load_undo_log(source_dir: Path) -> List[Dict]:
+    path = _undo_log_path(source_dir)
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
+def _save_undo_log(source_dir: Path, entries: List[Dict]) -> None:
+    path = _undo_log_path(source_dir)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2, ensure_ascii=False)
+    except IOError as exc:
+        print(f"⚠ Не удалось сохранить лог отмены: {exc}")
+
+
+def _append_undo_log(source_dir: Path, new_entries: List[Dict]) -> None:
+    existing = _load_undo_log(source_dir)
+    existing.extend(new_entries)
+    _save_undo_log(source_dir, existing)
+
+
+def get_undo_count(source_dir: str) -> int:
+    """Возвращает количество операций, доступных для отмены."""
+    return len(_load_undo_log(Path(source_dir).resolve()))
+
+
+# ── organize_files ─────────────────────────────────────────────────────────────
+
+def organize_files(
+    source_dir: str,
+    dry_run: bool = False,
+    verbose: bool = True,
+    recursive: Optional[bool] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Сортирует файлы по категориям.
+
+    Args:
+        source_dir:         Путь к директории
+        dry_run:            Только план, без действий (переопределяет конфиг)
+        verbose:            Подробный вывод в stdout
+        recursive:          None = брать из конфига, True/False = переопределить
+        log_callback:       Колбэк для строк лога (GUI / мониторинг)
+        progress_callback:  Колбэк (current: int, total: int) для прогресс-бара
+        config:             Конфигурация; None = загрузить из config.json
+
+    Returns:
+        Словарь статистики
+    """
     if config is None:
         config = load_config()
 
-    categories_data = config.get("categories", DEFAULT_CONFIG["categories"])
+    settings = config.get("settings", DEFAULT_CONFIG["settings"])
+    ext_map = _build_ext_map(config)
+    category_names: frozenset = frozenset(config.get("categories", {}).keys())
 
-    FILE_CATEGORIES = {}
-    EXTENSION_TO_CATEGORY = {}
+    # Параметр recursive: явный аргумент имеет приоритет над конфигом
+    use_recursive: bool = settings.get("recursive", True) if recursive is None else recursive
+    # dry_run: если передан True — переопределяем; иначе из конфига
+    use_dry_run: bool = settings.get("dry_run", False) or dry_run
+    clean_empty: bool = settings.get("clean_empty_dirs", True)
+    dup_strategy: str = settings.get("duplicate_strategy", "rename")  # rename | skip | replace
 
-    for category, extensions in categories_data.items():
-        FILE_CATEGORIES[category] = [f".{ext.lower()}" for ext in extensions]
-        for ext in extensions:
-            EXTENSION_TO_CATEGORY[f".{ext.lower()}"] = category
+    source_path = Path(source_dir).resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"Директория не найдена: {source_path}")
+    if not source_path.is_dir():
+        raise NotADirectoryError(f"Не является директорией: {source_path}")
 
-
-def get_category(file_path: Path) -> str:
-    """Определяет категорию файла по его расширению."""
-    ext = file_path.suffix.lower()
-    return EXTENSION_TO_CATEGORY.get(ext, 'other')
-
-
-def get_unique_filename(target_dir: Path, filename: str) -> str:
-    """Генерирует уникальное имя файла, если файл уже существует."""
-    target_path = target_dir / filename
-    if not target_path.exists():
-        return filename
-
-    stem = Path(filename).stem
-    suffix = Path(filename).suffix
-    counter = 1
-
-    while True:
-        new_name = f"{stem}_{counter}{suffix}"
-        if not (target_dir / new_name).exists():
-            return new_name
-        counter += 1
-
-
-def log_action(action_type: str, source: str, destination: str, original_name: str = ""):
-    """Записывает действие в лог для возможности отмены."""
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "action": action_type,
-        "source": source,
-        "destination": destination,
-        "original_name": original_name
+    stats: Dict[str, Any] = {
+        "moved": 0, "skipped": 0, "errors": 0,
+        "duplicates": 0, "empty_dirs_removed": 0,
+        "by_category": {},
     }
-    ACTION_LOG.append(entry)
-    return entry
+    session_log: List[Dict] = []
 
-
-def save_action_log(log_file: str):
-    """Сохраняет журнал действий в файл."""
-    if not ACTION_LOG:
-        return
-
-    with open(log_file, 'a', encoding='utf-8') as f:
-        for entry in ACTION_LOG:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    ACTION_LOG.clear()
-
-
-def undo_last_operation(source_dir: str, count: int = -1, verbose: bool = True, log_callback=None) -> dict:
-    """
-    Отменяет последние операции перемещения.
-
-    Args:
-        source_dir: Корневая директория (для контекста)
-        count: Количество операций для отмены (-1 для всех доступных в текущей сессии)
-        verbose: Выводить подробную информацию
-        log_callback: Функция обратного вызова для логирования
-
-    Returns:
-        Статистика отмененных операций
-    """
-    stats = {'restored': 0, 'errors': 0}
-
-    def log(message):
+    def log(msg: str) -> None:
         if log_callback:
-            log_callback(message)
+            log_callback(msg)
         elif verbose:
-            print(message)
+            print(msg)
 
-    log(f"\n{'='*60}")
-    log("ОТМЕНА ОПЕРАЦИЙ")
-    log(f"{'='*60}")
+    log(f"\n{'─'*60}")
+    log("  Умный органайзер файлов")
+    log(f"{'─'*60}")
+    log(f"  Директория : {source_path}")
+    log(f"  Режим      : {'рекурсивный' if use_recursive else 'только корень'}")
+    if use_dry_run:
+        log("  ⚠  DRY-RUN — файлы НЕ будут перемещены")
+    log(f"{'─'*60}\n")
 
-    if not ACTION_LOG:
-        log("Нет действий для отмены в текущей сессии.")
-        log("Примечание: Отмена работает только для действий, выполненных в рамках текущего запуска программы.")
+    # ── Сбор файлов ────────────────────────────────────────────────────────────
+    raw_files = (
+        [f for f in source_path.rglob("*") if f.is_file()]
+        if use_recursive
+        else [f for f in source_path.iterdir() if f.is_file()]
+    )
+
+    def _should_skip(f: Path) -> bool:
+        if settings.get("ignore_hidden", True) and f.name.startswith("."):
+            return True
+        if f.name in SCRIPT_FILES:
+            return True
+        # Файл уже лежит внутри папки категории (любой уровень вложенности)
+        try:
+            rel = f.relative_to(source_path)
+            if rel.parts[0] in category_names:
+                return True
+        except ValueError:
+            pass
+        return False
+
+    files = [f for f in raw_files if not _should_skip(f)]
+    total = len(files)
+    log(f"  Файлов для обработки: {total}\n")
+
+    if total == 0:
+        log("  Нечего делать.\n")
         return stats
 
-    operations_to_undo = ACTION_LOG[:] if count == -1 else ACTION_LOG[-count:]
+    # ── Обработка файлов ───────────────────────────────────────────────────────
+    for idx, file_path in enumerate(files, 1):
+        if progress_callback:
+            progress_callback(idx, total)
 
-    # Обрабатываем в обратном порядке (последние сначала)
-    for entry in reversed(operations_to_undo):
-        if entry['action'] != 'move':
-            continue
+        category = _get_category(file_path, ext_map)
+        target_dir = source_path / category
+        stats["by_category"].setdefault(category, 0)
 
-        dest_path = Path(entry['destination'])
-        source_path = Path(entry['source'])
-
-        if not dest_path.exists():
-            log(f"⚠ Файл не найден (уже удален?): {dest_path}")
-            stats['errors'] += 1
+        if use_dry_run:
+            try:
+                rel = file_path.relative_to(source_path)
+            except ValueError:
+                rel = file_path
+            log(f"  → {rel}  ➜  {category}/")
+            stats["moved"] += 1
+            stats["by_category"][category] += 1
             continue
 
         try:
-            # Убеждаемся, что исходная директория существует
-            source_path.parent.mkdir(parents=True, exist_ok=True)
+            target_dir.mkdir(exist_ok=True)
+            target_path = target_dir / file_path.name
 
-            shutil.move(str(dest_path), str(source_path))
-            log(f"✓ Восстановлено: {entry['original_name']} ← {entry['destination']}")
-            stats['restored'] += 1
+            # Стратегия дублей
+            if target_path.exists():
+                if dup_strategy == "skip":
+                    log(f"  ⏭  Пропущен (уже есть): {file_path.name}")
+                    stats["skipped"] += 1
+                    stats["duplicates"] += 1
+                    continue
+                elif dup_strategy == "replace":
+                    target_path.unlink()
+                    log(f"  🔄 Заменён: {file_path.name}")
+                    stats["duplicates"] += 1
+                else:  # rename (default)
+                    target_path = _get_unique_path(target_dir, file_path.name)
+                    log(f"  ⚠  Переименован: {file_path.name} → {target_path.name}")
+                    stats["duplicates"] += 1
 
-            # Удаляем запись из лога после успешной отмены
-            if entry in ACTION_LOG:
-                ACTION_LOG.remove(entry)
-
-        except Exception as e:
-            log(f"✗ Ошибка при отмене: {e}")
-            stats['errors'] += 1
-
-    log(f"\nВосстановлено файлов: {stats['restored']}")
-    log(f"Ошибок: {stats['errors']}")
-    log(f"{'='*60}\n")
-
-    return stats
-
-
-def organize_files(source_dir: str, dry_run: bool = False, verbose: bool = True,
-                   recursive: bool = True, log_callback: Optional[Callable] = None,
-                   config: Optional[Dict[str, Any]] = None) -> dict:
-    """
-    Сортирует файлы в указанной директории по категориям.
-
-    Args:
-        source_dir: Путь к директории для организации
-        dry_run: Если True, только показывает что будет сделано, без реальных действий
-        verbose: Выводить подробную информацию
-        recursive: Если True, обрабатывать файлы во всех подпапках
-        log_callback: Функция обратного вызова для логирования (для GUI)
-        config: Конфигурация (если None, загружается из config.json)
-
-    Returns:
-        Статистика выполненных операций
-    """
-    # Инициализация категорий
-    init_categories(config)
-
-    # Загрузка настроек
-    settings = config.get("settings", DEFAULT_CONFIG["settings"]) if config else DEFAULT_CONFIG["settings"]
-    if not dry_run: # Переопределяем dry_run из аргумента, если он явно передан
-        dry_run = settings.get("dry_run", False)
-
-    recursive = settings.get("recursive", True) if not recursive else recursive
-    clean_empty = settings.get("clean_empty_dirs", True)
-    log_file_name = settings.get("log_file", "actions.log")
-
-    source_path = Path(source_dir).resolve()
-
-    if not source_path.exists():
-        raise FileNotFoundError(f"Директория не найдена: {source_path}")
-
-    if not source_path.is_dir():
-        raise NotADirectoryError(f"Это не директория: {source_path}")
-
-    stats = {
-        'moved': 0,
-        'skipped': 0,
-        'errors': 0,
-        'by_category': {},
-        'empty_dirs_removed': 0
-    }
-
-    # Очищаем лог действий перед новой операцией
-    global ACTION_LOG
-    ACTION_LOG = []
-
-    def log(message):
-        if log_callback:
-            log_callback(message)
-        elif verbose:
-            print(message)
-
-    log(f"\n{'='*60}")
-    log("Умный органайзер файлов")
-    log(f"{'='*60}")
-    log(f"Целевая директория: {source_path}")
-    if recursive:
-        log("Режим: Рекурсивный (все подпапки)")
-    else:
-        log("Режим: Только корневая папка")
-    if dry_run:
-        log("РЕЖИМ ПРОСМОТРА (dry-run) - файлы не будут перемещены")
-    log(f"{'='*60}\n")
-
-    # Получаем список всех файлов
-    if recursive:
-        files = [f for f in source_path.rglob('*') if f.is_file()]
-    else:
-        files = [f for f in source_path.iterdir() if f.is_file()]
-
-    if not files:
-        log("Файлы не найдены в указанной директории.")
-        return stats
-
-    log(f"Найдено файлов: {len(files)}\n")
-
-    # Имена файлов, которые нужно игнорировать
-    ignore_names = {'organizer_core.py', 'file_organizer.py', 'file_organizer_gui.py', 'config.json', 'actions.log'}
-    ignore_names.update(FILE_CATEGORIES.keys()) # Игнорируем папки категорий
-
-    for file_path in files:
-        # Пропускаем скрытые файлы
-        if settings.get("ignore_hidden", True) and file_path.name.startswith('.'):
-            stats['skipped'] += 1
-            continue
-
-        # Пропускаем служебные файлы
-        if file_path.name in ignore_names or file_path.parent.name in FILE_CATEGORIES:
-             # Дополнительная проверка: если файл лежит внутри папки категории, пропускаем
-            if file_path.parent.name in FILE_CATEGORIES and file_path.parent.parent == source_path:
-                 stats['skipped'] += 1
-                 continue
-            if file_path.name in ignore_names:
-                 stats['skipped'] += 1
-                 continue
-
-        category = get_category(file_path)
-        target_dir = source_path / category
-
-        # Инициализируем счетчик категории
-        if category not in stats['by_category']:
-            stats['by_category'][category] = 0
-
-        if dry_run:
-            log(f"→ Будет перемещено: {file_path.name} → {category}/")
-            stats['moved'] += 1
-            stats['by_category'][category] += 1
-        else:
+            shutil.move(str(file_path), str(target_path))
             try:
-                # Создаем папку категории если не существует
-                target_dir.mkdir(exist_ok=True)
+                rel = file_path.relative_to(source_path)
+            except ValueError:
+                rel = file_path
+            log(f"  ✓  {rel}  ➜  {category}/{target_path.name}")
 
-                # Обрабатываем дубликаты имен
-                final_name = get_unique_filename(target_dir, file_path.name)
-                target_path = target_dir / final_name
+            session_log.append({
+                "timestamp":     datetime.now().isoformat(),
+                "action":        "move",
+                "source":        str(file_path),
+                "destination":   str(target_path),
+                "original_name": file_path.name,
+            })
+            stats["moved"] += 1
+            stats["by_category"][category] += 1
 
-                renamed = final_name != file_path.name
-                if renamed:
-                    log(f"⚠ Файл {file_path.name} уже существует, переименован в {final_name}")
+        except Exception as exc:
+            log(f"  ✗  Ошибка: {file_path.name} — {exc}")
+            stats["errors"] += 1
 
-                # Перемещаем файл
-                shutil.move(str(file_path), str(target_path))
+    # ── Сохранение персистентного лога отмены ──────────────────────────────────
+    if session_log:
+        _append_undo_log(source_path, session_log)
+        with _lock:
+            _action_log.extend(session_log)
 
-                log(f"✓ Перемещено: {file_path.name} → {category}/{final_name}")
-
-                # Логируем действие для отмены
-                log_action('move', str(file_path), str(target_path), file_path.name)
-
-                stats['moved'] += 1
-                stats['by_category'][category] += 1
-
-            except Exception as e:
-                log(f"✗ Ошибка при перемещении {file_path.name}: {e}")
-                stats['errors'] += 1
-
-    # Сохраняем лог действий
-    if not dry_run and stats['moved'] > 0:
-        save_action_log(source_path / log_file_name)
-        log(f"\n📝 Журнал действий сохранен в: {log_file_name}")
-
-    # Удаление пустых папок
-    if not dry_run and recursive and clean_empty:
-        log("\nОчистка пустых папок...")
-        for dirpath, dirnames, filenames in os.walk(str(source_path), topdown=False):
-            dirpath = Path(dirpath)
-            # Не удаляем корневую директорию и папки категорий
+    # ── Удаление пустых папок ──────────────────────────────────────────────────
+    if not use_dry_run and use_recursive and clean_empty:
+        log("\n  Очистка пустых папок...")
+        # Обходим от глубоких к верхним
+        dirs_deep_first = sorted(
+            (d for d in source_path.rglob("*") if d.is_dir()),
+            key=lambda p: len(p.parts),
+            reverse=True,
+        )
+        for dirpath in dirs_deep_first:
             if dirpath == source_path:
                 continue
-            if dirpath.parent == source_path and dirpath.name in FILE_CATEGORIES:
+            try:
+                rel = dirpath.relative_to(source_path)
+            except ValueError:
                 continue
-
+            if rel.parts[0] in category_names:
+                continue
             try:
                 if not any(dirpath.iterdir()):
                     dirpath.rmdir()
-                    stats['empty_dirs_removed'] += 1
-                    log(f"✓ Удалена пустая папка: {dirpath.relative_to(source_path)}")
-            except Exception as e:
-                log(f"⚠ Не удалось удалить папку {dirpath}: {e}")
+                    stats["empty_dirs_removed"] += 1
+                    log(f"  ✓  Удалена пустая папка: {rel}")
+            except Exception:
+                pass
 
-    # Вывод статистики
-    log(f"\n{'='*60}")
-    log("СТАТИСТИКА")
-    log(f"{'='*60}")
-    log(f"Всего обработано: {stats['moved'] + stats['skipped']}")
-    log(f"Перемещено: {stats['moved']}")
-    log(f"Пропущено: {stats['skipped']}")
-    log(f"Ошибок: {stats['errors']}")
-    if recursive and not dry_run:
-        log(f"Удалено пустых папок: {stats['empty_dirs_removed']}")
-
-    if stats['by_category']:
-        log("\nПо категориям:")
-        for category, count in sorted(stats['by_category'].items()):
-            log(f"  {category}: {count}")
-
-    log(f"{'='*60}\n")
+    # ── Статистика ─────────────────────────────────────────────────────────────
+    log(f"\n{'─'*60}")
+    log("  ИТОГО")
+    log(f"{'─'*60}")
+    log(f"  Перемещено  : {stats['moved']}")
+    log(f"  Пропущено   : {stats['skipped']}")
+    log(f"  Дубликаты   : {stats['duplicates']}")
+    log(f"  Ошибки      : {stats['errors']}")
+    if use_recursive and not use_dry_run:
+        log(f"  Пустых папок удалено: {stats['empty_dirs_removed']}")
+    if stats["by_category"]:
+        log("\n  По категориям:")
+        for cat, cnt in sorted(stats["by_category"].items()):
+            log(f"    {cat:<16}{cnt}")
+    log(f"{'─'*60}\n")
 
     return stats
 
 
-def start_monitoring(source_dir: str, interval: int = 10, callback: Optional[Callable] = None):
+# ── undo_last_operation ────────────────────────────────────────────────────────
+
+def undo_last_operation(
+    source_dir: str,
+    count: int = -1,
+    verbose: bool = True,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> Dict[str, int]:
     """
-    Запускает фоновый мониторинг директории и автоматическую сортировку новых файлов.
+    Отменяет последние операции перемещения.
+
+    Читает из персистентного лога — работает после перезапуска программы.
 
     Args:
-        source_dir: Директория для мониторинга
-        interval: Интервал проверки в секундах
-        callback: Функция обратного вызова при обнаружении изменений
+        source_dir:   Корневая директория
+        count:        Сколько операций отменить (-1 = все)
+        verbose:      Подробный вывод в stdout
+        log_callback: Колбэк для строк лога
     """
-    global MONITORING_STOP_EVENT
-    MONITORING_STOP_EVENT = threading.Event()
-
+    stats = {"restored": 0, "errors": 0}
     source_path = Path(source_dir).resolve()
-    initial_files = set()
 
-    # Собираем начальный список файлов
-    if source_path.exists():
-        initial_files = {str(f.relative_to(source_path)) for f in source_path.rglob('*') if f.is_file()}
+    def log(msg: str) -> None:
+        if log_callback:
+            log_callback(msg)
+        elif verbose:
+            print(msg)
 
-    def monitor_loop():
-        nonlocal initial_files
-        while not MONITORING_STOP_EVENT.is_set():
-            time.sleep(interval)
+    log(f"\n{'─'*60}")
+    log("  ОТМЕНА ОПЕРАЦИЙ")
+    log(f"{'─'*60}")
 
-            if not source_path.exists():
-                continue
+    all_entries = _load_undo_log(source_path)
+    if not all_entries:
+        log("  Нет операций для отмены.")
+        log(f"{'─'*60}\n")
+        return stats
 
-            current_files = {str(f.relative_to(source_path)) for f in source_path.rglob('*') if f.is_file()}
-            new_files = current_files - initial_files
+    if count == -1:
+        to_undo = all_entries
+        remaining: List[Dict] = []
+    else:
+        to_undo = all_entries[-count:]
+        remaining = all_entries[: len(all_entries) - count]
 
-            if new_files:
-                msg = f"🔍 Обнаружено новых файлов: {len(new_files)}. Запуск сортировки..."
-                if callback:
-                    callback(msg)
-                else:
-                    print(msg)
+    log(f"  Операций для отмены: {len(to_undo)}\n")
 
-                # Запускаем сортировку только для новых файлов (упрощенно - полный прогон)
-                # В реальной реализации можно оптимизировать передачу списка файлов
+    failed: List[Dict] = []
+    for entry in reversed(to_undo):
+        if entry.get("action") != "move":
+            continue
+
+        dest = Path(entry["destination"])
+        src = Path(entry["source"])
+
+        if not dest.exists():
+            log(f"  ⚠  Файл не найден: {dest.name}")
+            stats["errors"] += 1
+            failed.append(entry)
+            continue
+
+        try:
+            src.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(dest), str(src))
+            log(f"  ✓  Восстановлен: {entry['original_name']}")
+            stats["restored"] += 1
+        except Exception as exc:
+            log(f"  ✗  Ошибка: {exc}")
+            stats["errors"] += 1
+            failed.append(entry)
+
+    _save_undo_log(source_path, remaining + failed)
+
+    with _lock:
+        _action_log.clear()
+
+    log(f"\n  Восстановлено : {stats['restored']}")
+    log(f"  Ошибок        : {stats['errors']}")
+    log(f"{'─'*60}\n")
+    return stats
+
+
+# ── Мониторинг ─────────────────────────────────────────────────────────────────
+
+def start_monitoring(
+    source_dir: str,
+    interval: int = 10,
+    callback: Optional[Callable[[str], None]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> threading.Thread:
+    """
+    Запускает фоновый мониторинг директории.
+
+    Использует watchdog (если установлен) для мгновенной реакции на события ФС.
+    При отсутствии watchdog — polling с указанным интервалом.
+    """
+    global _monitoring_stop_event
+    _monitoring_stop_event = threading.Event()
+    source_path = Path(source_dir).resolve()
+
+    def _log(msg: str) -> None:
+        if callback:
+            callback(msg)
+        else:
+            print(msg)
+
+    def _run_sort(new_count: int) -> None:
+        _log(f"🔍 Новых файлов: {new_count}. Запуск сортировки...")
+        try:
+            # Передаём config, чтобы не перечитывать с диска каждый раз
+            stats = organize_files(
+                str(source_path),
+                verbose=False,
+                log_callback=callback,
+                config=config,
+            )
+            _log(f"✅ Перемещено: {stats['moved']}, пропущено: {stats['skipped']}")
+        except Exception as exc:
+            _log(f"❌ Ошибка при сортировке: {exc}")
+
+    # ── Попытка использовать watchdog ──────────────────────────────────────────
+    use_watchdog = (config or {}).get("settings", {}).get("use_watchdog", True)
+
+    if use_watchdog:
+        try:
+            from watchdog.observers import Observer          # type: ignore
+            from watchdog.events import FileSystemEventHandler  # type: ignore
+
+            class _Handler(FileSystemEventHandler):
+                def __init__(self) -> None:
+                    self._pending: set = set()
+                    self._timer: Optional[threading.Timer] = None
+                    self._tlock = threading.Lock()
+
+                def on_created(self, event) -> None:
+                    if event.is_directory:
+                        return
+                    with self._tlock:
+                        self._pending.add(event.src_path)
+                        if self._timer:
+                            self._timer.cancel()
+                        # Debounce 2 с — ждём паузы между событиями
+                        self._timer = threading.Timer(2.0, self._flush)
+                        self._timer.daemon = True
+                        self._timer.start()
+
+                def _flush(self) -> None:
+                    with self._tlock:
+                        count = len(self._pending)
+                        self._pending.clear()
+                    if count:
+                        _run_sort(count)
+
+            observer = Observer()
+            observer.schedule(_Handler(), str(source_path), recursive=True)
+            observer.start()
+            _log(f"🚀 Мониторинг запущен (watchdog) — {source_path}")
+
+            def _watchdog_loop() -> None:
                 try:
-                    stats = organize_files(str(source_path), verbose=False, log_callback=callback)
-                    if stats['moved'] > 0:
-                        msg = f"✅ Сортировка завершена. Перемещено: {stats['moved']}"
-                        if callback:
-                            callback(msg)
-                        else:
-                            print(msg)
-                except Exception as e:
-                    msg = f"❌ Ошибка при сортировке: {e}"
-                    if callback:
-                        callback(msg)
-                    else:
-                        print(msg)
+                    while not _monitoring_stop_event.is_set():
+                        _monitoring_stop_event.wait(timeout=1)
+                finally:
+                    observer.stop()
+                    observer.join()
+                    _log("⏹  Мониторинг остановлен.")
 
-                # Обновляем список известных файлов
-                initial_files = current_files
+            t = threading.Thread(target=_watchdog_loop, daemon=True)
+            t.start()
+            return t
 
-    thread = threading.Thread(target=monitor_loop, daemon=True)
-    thread.start()
-    return thread
+        except ImportError:
+            _log("ℹ  watchdog не установлен — используется polling.")
+
+    # ── Fallback: polling ──────────────────────────────────────────────────────
+    def _snapshot() -> Dict[str, float]:
+        if not source_path.exists():
+            return {}
+        return {
+            str(f): f.stat().st_mtime
+            for f in source_path.rglob("*")
+            if f.is_file() and not f.name.startswith(".")
+        }
+
+    initial = _snapshot()
+
+    def _polling_loop() -> None:
+        nonlocal initial
+        _log(f"🚀 Мониторинг запущен (polling, интервал {interval} с) — {source_path}")
+        while not _monitoring_stop_event.wait(timeout=interval):
+            try:
+                current = _snapshot()
+                new_files = {k for k in current if k not in initial}
+                if new_files:
+                    _run_sort(len(new_files))
+                    # Обновляем снимок после сортировки
+                    initial = _snapshot()
+                else:
+                    initial = current
+            except Exception as exc:
+                _log(f"⚠  Ошибка мониторинга: {exc}")
+        _log("⏹  Мониторинг остановлен.")
+
+    t = threading.Thread(target=_polling_loop, daemon=True)
+    t.start()
+    return t
 
 
-def stop_monitoring():
+def stop_monitoring() -> None:
     """Останавливает фоновый мониторинг."""
-    MONITORING_STOP_EVENT.set()
+    _monitoring_stop_event.set()
