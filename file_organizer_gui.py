@@ -20,6 +20,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from organizer_core import (
+    _is_protected_dir,
     get_undo_count,
     load_config,
     organize_files,
@@ -195,13 +196,38 @@ class FileOrganizerApp:
         path = self.source_path.get()
         if not path:
             return
+
+        # Безопасное открытие папки без Command Injection
+        # Валидация пути перед использованием
         try:
+            path_obj = Path(path).resolve()
+
+            # Проверка, что путь существует и это директория
+            if not path_obj.exists():
+                messagebox.showerror("Ошибка", f"Папка не найдена: {path}")
+                return
+            if not path_obj.is_dir():
+                messagebox.showerror("Ошибка", f"Не является папкой: {path}")
+                return
+
+            # Проверка на защищённые системные директории
+            if _is_protected_dir(path_obj):
+                messagebox.showerror("Ошибка", "Отказ в открытии защищённой системной директории")
+                return
+
             if platform.system() == "Windows":
-                os.startfile(path)
+                # Безопасная альтернатива os.startfile с проверками
+                os.startfile(str(path_obj))
             elif platform.system() == "Darwin":
-                subprocess.Popen(["open", path])
+                # subprocess.run вместо Popen для безопасности
+                subprocess.run(["open", str(path_obj)], check=True, timeout=5)
             else:
-                subprocess.Popen(["xdg-open", path])
+                # subprocess.run вместо Popen для безопасности
+                subprocess.run(["xdg-open", str(path_obj)], check=True, timeout=5)
+        except subprocess.TimeoutExpired:
+            messagebox.showerror("Ошибка", "Превышено время ожидания при открытии папки")
+        except subprocess.CalledProcessError as exc:
+            messagebox.showerror("Ошибка", f"Не удалось открыть папку: {exc}")
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc))
 
