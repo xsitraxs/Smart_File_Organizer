@@ -45,7 +45,7 @@ def get_category(file_path: Path) -> str:
     return EXTENSION_TO_CATEGORY.get(ext, 'other')
 
 
-def organize_files(source_dir: str, dry_run: bool = False, verbose: bool = True) -> dict:
+def organize_files(source_dir: str, dry_run: bool = False, verbose: bool = True, recursive: bool = True) -> dict:
     """
     Сортирует файлы в указанной директории по категориям.
 
@@ -53,6 +53,7 @@ def organize_files(source_dir: str, dry_run: bool = False, verbose: bool = True)
         source_dir: Путь к директории для организации
         dry_run: Если True, только показывает что будет сделано, без реальных действий
         verbose: Выводить подробную информацию
+        recursive: Если True, обрабатывать файлы во всех подпапках
 
     Returns:
         Статистика выполненных операций
@@ -69,19 +70,27 @@ def organize_files(source_dir: str, dry_run: bool = False, verbose: bool = True)
         'moved': 0,
         'skipped': 0,
         'errors': 0,
-        'by_category': {}
+        'by_category': {},
+        'empty_dirs_removed': 0
     }
 
     print(f"\n{'='*60}")
     print(f"Умный органайзер файлов")
     print(f"{'='*60}")
     print(f"Целевая директория: {source_path}")
+    if recursive:
+        print("Режим: Рекурсивный (все подпапки)")
+    else:
+        print("Режим: Только корневая папка")
     if dry_run:
         print("РЕЖИМ ПРОСМОТРА (dry-run) - файлы не будут перемещены")
     print(f"{'='*60}\n")
 
-    # Получаем список всех файлов в корневой директории (не рекурсивно)
-    files = [f for f in source_path.iterdir() if f.is_file()]
+    # Получаем список всех файлов
+    if recursive:
+        files = [f for f in source_path.rglob('*') if f.is_file()]
+    else:
+        files = [f for f in source_path.iterdir() if f.is_file()]
 
     if not files:
         print("Файлы не найдены в указанной директории.")
@@ -137,6 +146,27 @@ def organize_files(source_dir: str, dry_run: bool = False, verbose: bool = True)
                 print(f"✗ Ошибка при перемещении {file_path.name}: {e}")
                 stats['errors'] += 1
 
+    # Удаление пустых папок (только если не dry-run и рекурсивный режим)
+    if not dry_run and recursive:
+        print("\nОчистка пустых папок...")
+        for dirpath, dirnames, filenames in os.walk(str(source_path), topdown=False):
+            dirpath = Path(dirpath)
+            # Не удаляем корневую директорию и папки категорий
+            if dirpath == source_path:
+                continue
+            if dirpath.parent == source_path and dirpath.name in FILE_CATEGORIES:
+                continue
+
+            try:
+                if not any(dirpath.iterdir()):
+                    dirpath.rmdir()
+                    stats['empty_dirs_removed'] += 1
+                    if verbose:
+                        print(f"✓ Удалена пустая папка: {dirpath.relative_to(source_path)}")
+            except Exception as e:
+                if verbose:
+                    print(f"⚠ Не удалось удалить папку {dirpath}: {e}")
+
     # Вывод статистики
     print(f"\n{'='*60}")
     print("СТАТИСТИКА")
@@ -145,6 +175,8 @@ def organize_files(source_dir: str, dry_run: bool = False, verbose: bool = True)
     print(f"Перемещено: {stats['moved']}")
     print(f"Пропущено: {stats['skipped']}")
     print(f"Ошибок: {stats['errors']}")
+    if recursive and not dry_run:
+        print(f"Удалено пустых папок: {stats['empty_dirs_removed']}")
 
     if stats['by_category']:
         print("\nПо категориям:")
@@ -189,10 +221,17 @@ def main():
         help='Тихий режим: минимальный вывод информации'
     )
 
+    parser.add_argument(
+        '--no-recursive',
+        action='store_false',
+        dest='recursive',
+        help='Не обрабатывать подпапки (только файлы в корневой директории)'
+    )
+
     args = parser.parse_args()
 
     try:
-        organize_files(args.directory, dry_run=args.dry_run, verbose=args.verbose)
+        organize_files(args.directory, dry_run=args.dry_run, verbose=args.verbose, recursive=args.recursive)
     except KeyboardInterrupt:
         print("\n\nОперация отменена пользователем.")
     except Exception as e:
