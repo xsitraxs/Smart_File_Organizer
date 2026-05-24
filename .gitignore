@@ -13,10 +13,7 @@ env/
 venv/
 .venv/
 .ENV
-.ENV.local
-.env
-.env.local
-.env.*
+.python-version
 
 # Logs
 *.log
@@ -30,18 +27,26 @@ venv/
 ehthumbs.db
 Thumbs.db
 
-# IDE
+# Local configuration
 .vscode/
 .idea/
 
-# Temp files
-*.tmp
-*.temp
-*~
-```
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
 
-Wait, let me reconsider. The only files mentioned in the changes are `.gitignore`, `file_organizer.py`, `file_organizer_gui.py`, and `README.md` - all of which are source/config files. There are no build artifacts, dependencies, or temporary files in the change list.
+# Environment variables
+.env
+.env.local
+*.env.*
 
-```
+# Build artifacts
+build/
+dist/
+*.egg-info/
 
+# Testing
+.pytest_cache/
+.mypy_cache/
 ```
