@@ -1,7 +1,3 @@
---- file_organizer_gui.py (原始)
-
-
-+++ file_organizer_gui.py (修改后)
 import os
 import shutil
 import tkinter as tk
