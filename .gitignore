@@ -9,41 +9,25 @@ env/
 venv/
 .venv/
 .ENV
-.ENV.*
-.python-version
+.ENV.local
+env.bak/
+venv.bak/
 
 # Logs
 *.log
 
-# OS generated files
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
-# Environment variables
+# Environment files
 .env
 .env.local
 .env.*
-
-# Coverage reports
-.coverage
-htmlcov/
-.coverage.*
-
-# Pytest cache
-.pytest_cache/
-
-# MyPy cache
-.mypy_cache/
-
-# VSCode
-.vscode/
-
-# Temporary files
-*.tmp
-*.temp
 ```
