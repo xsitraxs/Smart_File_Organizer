@@ -12,35 +12,16 @@ venv/
 .python-version
 pip-log.txt
 pip-delete-this-directory.txt
-
-# Generated documentation
-docs/_build/
-
-# Testing
+.tox/
 .coverage
-coverage/
+.coverage.*
+.cache
 nosetests.xml
-unit_log.xml
-htmlcov/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*.tmp
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
+coverage.xml
+*.cover
 *.log
-
-# Environment variables
-.env
-.env.local
-*.env.*
+.pytest_cache/
+.mypy_cache/
 
 # Distribution / packaging
 .Python
@@ -59,7 +40,32 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+*.env.*
+
+# Logs
+*.log
 
 # Coverage
-.coverage*
+htmlcov/
+.coverage
 ```
