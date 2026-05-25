@@ -254,13 +254,16 @@ def _undo_log_path(source_dir: Path) -> Path:
     return source_dir / UNDO_LOG_FILENAME
 
 
-def _load_undo_log(source_dir: Path) -> List[Dict]:
+def _load_undo_log(source_dir: Path) -> List[Dict[str, Any]]:
     path = _undo_log_path(source_dir)
     if not path.exists():
         return []
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            return []
     except (json.JSONDecodeError, IOError):
         return []
 
@@ -348,7 +351,7 @@ def organize_files(
         if log_callback:
             log_callback(msg)
         elif verbose:
-            print(msg)
+            logger.info(msg)
 
     log(f"\n{'─'*60}")
     log("  Умный органайзер файлов")
@@ -566,7 +569,7 @@ def undo_last_operation(
         if log_callback:
             log_callback(msg)
         elif verbose:
-            print(msg)
+            logger.info(msg)
 
     log(f"\n{'─'*60}")
     log("  ОТМЕНА ОПЕРАЦИЙ")
@@ -645,7 +648,7 @@ def start_monitoring(
         if callback:
             callback(msg)
         else:
-            print(msg)
+            logger.info(msg)
 
     def _run_sort(new_count: int) -> None:
         _log(f"🔍 Новых файлов: {new_count}. Запуск сортировки...")
@@ -666,8 +669,8 @@ def start_monitoring(
 
     if use_watchdog:
         try:
-            from watchdog.observers import Observer          # type: ignore
-            from watchdog.events import FileSystemEventHandler  # type: ignore
+            from watchdog.observers import Observer
+            from watchdog.events import FileSystemEventHandler
 
             class _Handler(FileSystemEventHandler):
                 def __init__(self) -> None:
@@ -675,7 +678,7 @@ def start_monitoring(
                     self._timer: Optional[threading.Timer] = None
                     self._tlock = threading.Lock()
 
-                def on_created(self, event) -> None:
+                def on_created(self, event: Any) -> None:
                     if event.is_directory:
                         return
                     with self._tlock:
