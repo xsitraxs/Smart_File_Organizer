@@ -5,6 +5,7 @@
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from organizer_core import (
     stop_monitoring,
     undo_last_operation,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -78,7 +81,7 @@ def main() -> None:
     target_dir = Path(args.directory).resolve()
 
     if not target_dir.exists():
-        print(f"❌ Директория не найдена: {target_dir}")
+        logger.error(f"Директория не найдена: {target_dir}")
         sys.exit(1)
 
     config = load_config()
@@ -86,7 +89,7 @@ def main() -> None:
     # Информация об undo
     if args.undo_info:
         n = get_undo_count(str(target_dir))
-        print(f"Доступно операций для отмены: {n}")
+        logger.info(f"Доступно операций для отмены: {n}")
         return
 
     # Режим отмены
@@ -100,12 +103,12 @@ def main() -> None:
 
     # Режим мониторинга
     if args.monitor:
-        print(f"🚀 Запуск мониторинга: {target_dir}")
-        print(f"⏱  Интервал: {args.interval} с.  Ctrl+C для остановки.\n")
+        logger.info(f"🚀 Запуск мониторинга: {target_dir}")
+        logger.info(f"⏱  Интервал: {args.interval} с.  Ctrl+C для остановки.\n")
 
         def _cb(msg: str) -> None:
             if not args.quiet:
-                print(msg)
+                logger.info(msg)
 
         try:
             thread = start_monitoring(
@@ -117,9 +120,9 @@ def main() -> None:
             while thread.is_alive():
                 thread.join(timeout=1)
         except KeyboardInterrupt:
-            print("\n⏹  Остановка мониторинга...")
+            logger.info("\n⏹  Остановка мониторинга...")
             stop_monitoring()
-            print("✅ Готово.")
+            logger.info("✅ Готово.")
         return
 
     # Обычная сортировка
@@ -135,7 +138,7 @@ def main() -> None:
             config=config,
         )
     except Exception as exc:
-        print(f"❌ Критическая ошибка: {exc}")
+        logger.error(f"❌ Критическая ошибка: {exc}")
         sys.exit(1)
 
 
