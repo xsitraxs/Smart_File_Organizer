@@ -49,6 +49,9 @@ class FileOrganizerApp:
 
         self._build_ui()
 
+        # Корректная остановка мониторинга при закрытии окна
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
         # Обновляем счётчик undo при смене пути
         self.source_path.trace_add("write", lambda *_: self._update_undo_label())
 
@@ -188,6 +191,12 @@ class FileOrganizerApp:
         self._is_running = False
         self._update_undo_label()
 
+    def _on_close(self) -> None:
+        """Корректное завершение: останавливаем мониторинг перед закрытием окна."""
+        if self._is_running:
+            stop_monitoring()
+        self.root.destroy()
+
     def _browse(self) -> None:
         folder = filedialog.askdirectory(title="Выберите папку")
         if folder:
@@ -217,9 +226,9 @@ class FileOrganizerApp:
                 return
 
             if platform.system() == "Windows":
-                # Безопасная альтернатива os.startfile с проверками
-                import ctypes
-                ctypes.windll.shell32.ShellExecuteW(None, "open", str(path_obj), None, None, 1)  # type: ignore[attr-defined]
+                # os.startfile безопаснее ctypes.windll.shell32.ShellExecuteW:
+                # не подвержен edge cases со специальными символами в пути
+                os.startfile(str(path_obj))
             elif platform.system() == "Darwin":
                 # subprocess.run вместо Popen для безопасности
                 subprocess.run(["open", str(path_obj)], check=True, timeout=5)
