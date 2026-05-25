@@ -1,32 +1,4 @@
 #!/usr/bin/env python3
-"""
-Ядро умного органайзера файлов — улучшенная версия.
-
-Исправлено:
-- Персистентный лог отмены (работает после перезапуска)
-- Потокобезопасность (threading.Lock)
-- Логика recursive больше не инвертирована
-- Мониторинг не сбрасывает лог отмены
-- Поддержка watchdog (с polling-фоллбэком)
-- progress_callback(current, total) для GUI
-- Стратегии дублей: rename / skip / replace
-- Глубокое слияние конфигов
-- Исправлен баг с undo: пути в логе теперь относительные
-
-Исправления безопасности (12 уязвимостей):
-- Path Traversal: проверка, что пути внутри source_dir
-- TOCTOU: атомарные операции с lock
-- Валидация путей: запрет "..", абсолютных путей, symlink вне директории
-- Command Injection: безопасная замена os.startfile/subprocess
-- Symlink: проверка назначения symlink
-- DoS: лимит итераций (1000 вместо 100000)
-- SHA256 вместо MD5
-- Лимит размера файла (1GB по умолчанию)
-- Маскировка путей в логах
-- Конфигурируемые имена скриптов
-- Строгая валидация конфига
-- Защита системных директорий от удаления
-"""
 
 import copy
 import hashlib
@@ -76,6 +48,15 @@ PROTECTED_DIRS: Set[str] = {
     "home", "root", "boot", "dev", "proc", "sys",
 }
 
+# Абсолютные пути к защищённым системным директориям (Unix + Windows)
+PROTECTED_ABS_PATHS: List[Path] = [
+    Path(p) for p in (
+        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64",
+        "/var", "/boot", "/dev", "/proc", "/sys",
+        "C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)",
+    )
+]
+
 # Лимиты безопасности
 MAX_UNIQUE_PATH_ATTEMPTS = 1000  # Защита от DoS
 MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1 GB лимит размера файла
@@ -113,9 +94,35 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 _lock = threading.Lock()
 _action_log: List[Dict] = []           # in-memory лог текущей сессии
 _monitoring_stop_event = threading.Event()
+_monitoring_thread: Optional[threading.Thread] = None  # отслеживаем текущий поток мониторинга
 
 
 # ── Конфигурация ───────────────────────────────────────────────────────────────
+
+def _validate_config_schema(config: Dict[str, Any]) -> bool:
+    """
+    Проверяет базовую схему конфига: наличие и типы ключевых полей.
+    Возвращает False при невалидных типах данных.
+    """
+    if not isinstance(config.get("categories"), dict):
+        return False
+    if not isinstance(config.get("settings"), dict):
+        return False
+    s = config["settings"]
+    type_checks = [
+        ("dry_run",            bool),
+        ("recursive",          bool),
+        ("clean_empty_dirs",   bool),
+        ("ignore_hidden",      bool),
+        ("duplicate_strategy", str),
+        ("use_watchdog",       bool),
+    ]
+    for key, expected_type in type_checks:
+        if key in s and not isinstance(s[key], expected_type):
+            logger.warning(f"config.json: неверный тип поля settings.{key} (ожидается {expected_type.__name__})")
+            return False
+    return True
+
 
 def load_config() -> Dict[str, Any]:
     """Загружает конфиг с глубоким слиянием с дефолтными значениями."""
@@ -123,6 +130,9 @@ def load_config() -> Dict[str, Any]:
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 user = json.load(f)
+            if not _validate_config_schema(user):
+                logger.warning("config.json не прошёл валидацию схемы. Используются дефолтные настройки.")
+                return copy.deepcopy(DEFAULT_CONFIG)
             merged = copy.deepcopy(DEFAULT_CONFIG)
             for key, val in user.items():
                 if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
@@ -218,9 +228,21 @@ def _get_script_files(config: Dict[str, Any]) -> Set[str]:
 
 
 def _is_protected_dir(dirpath: Path) -> bool:
-    """Проверяет, является ли директория защищённой системной."""
-    dir_name = dirpath.name.lower()
-    return dir_name in PROTECTED_DIRS
+    """Проверяет, является ли директория защищённой системной (по имени и по абсолютному пути)."""
+    if dirpath.name.lower() in PROTECTED_DIRS:
+        return True
+    try:
+        resolved = dirpath.resolve()
+        for protected in PROTECTED_ABS_PATHS:
+            try:
+                # Совпадение или вложенность в защищённый путь
+                resolved.relative_to(protected)
+                return True
+            except ValueError:
+                continue
+    except (OSError, ValueError):
+        pass
+    return False
 
 
 def _get_unique_path(target_dir: Path, filename: str) -> Path:
@@ -375,9 +397,11 @@ def organize_files(
         if f.name in script_files:  # Используем настраиваемый список
             return True
         # Файл уже лежит внутри папки категории (любой уровень вложенности)
+        # Сравниваем без учёта регистра, чтобы избежать повторной обработки папок
+        # с именами типа "Documents" или "IMAGES"
         try:
             rel = f.relative_to(source_path)
-            if rel.parts[0] in category_names:
+            if rel.parts[0].lower() in {c.lower() for c in category_names}:
                 return True
         except ValueError:
             pass
@@ -599,6 +623,19 @@ def undo_last_operation(
         dest = source_path / entry["destination"]
         src = source_path / entry["source"]
 
+        # ── Критическая проверка: пути из лога могут быть подделаны ──────────
+        # Защита от path traversal через подмену .organizer_undo.json
+        if not _validate_path_safety(dest, source_path):
+            log(f"  ✗  Небезопасный путь назначения в логе: {entry.get('original_name', '?')}")
+            stats["errors"] += 1
+            failed.append(entry)
+            continue
+        if not _validate_path_safety(src, source_path):
+            log(f"  ✗  Небезопасный исходный путь в логе: {entry.get('original_name', '?')}")
+            stats["errors"] += 1
+            failed.append(entry)
+            continue
+
         if not dest.exists():
             log(f"  ⚠  Файл не найден: {dest.name}")
             stats["errors"] += 1
@@ -640,7 +677,13 @@ def start_monitoring(
     Использует watchdog (если установлен) для мгновенной реакции на события ФС.
     При отсутствии watchdog — polling с указанным интервалом.
     """
-    global _monitoring_stop_event
+    global _monitoring_stop_event, _monitoring_thread
+
+    # Останавливаем предыдущий мониторинг, если он ещё работает
+    if _monitoring_thread is not None and _monitoring_thread.is_alive():
+        _monitoring_stop_event.set()
+        _monitoring_thread.join(timeout=5)
+
     _monitoring_stop_event = threading.Event()
     source_path = Path(source_dir).resolve()
 
@@ -713,6 +756,7 @@ def start_monitoring(
 
             t = threading.Thread(target=_watchdog_loop, daemon=True)
             t.start()
+            _monitoring_thread = t
             return t
 
         except ImportError:
@@ -749,6 +793,7 @@ def start_monitoring(
 
     t = threading.Thread(target=_polling_loop, daemon=True)
     t.start()
+    _monitoring_thread = t
     return t
 
 
