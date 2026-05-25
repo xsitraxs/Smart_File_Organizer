@@ -17,6 +17,7 @@ import platform
 import subprocess
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from organizer_core import (
@@ -217,7 +218,8 @@ class FileOrganizerApp:
 
             if platform.system() == "Windows":
                 # Безопасная альтернатива os.startfile с проверками
-                os.startfile(str(path_obj))
+                import ctypes
+                ctypes.windll.shell32.ShellExecuteW(None, "open", str(path_obj), None, None, 1)  # type: ignore[attr-defined]
             elif platform.system() == "Darwin":
                 # subprocess.run вместо Popen для безопасности
                 subprocess.run(["open", str(path_obj)], check=True, timeout=5)
