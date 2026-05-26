@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import copy
-import hashlib
 import json
 import logging
 import os
@@ -95,7 +94,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # ── Глобальное состояние (потокобезопасное) ────────────────────────────────────
 
 _lock = threading.Lock()
-_action_log: List[Dict] = []           # in-memory лог текущей сессии
+_organize_lock = threading.Lock()      # защита от параллельных запусков organize_files
+_action_log: List[Dict] = []           # in-memory лог текущей сессии (для совместимости с тестами)
 _monitoring_stop_event = threading.Event()
 _monitoring_thread: Optional[threading.Thread] = None  # отслеживаем текущий поток мониторинга
 
@@ -128,6 +128,15 @@ def _validate_config_schema(config: Dict[str, Any]) -> bool:
         if key in s and not isinstance(s[key], expected_type):
             logger.warning(f"config.json: неверный тип поля settings.{key} (ожидается {expected_type.__name__})")
             return False
+    # Валидация значения duplicate_strategy
+    valid_strategies = {"rename", "skip", "replace"}
+    strategy = s.get("duplicate_strategy")
+    if strategy is not None and strategy not in valid_strategies:
+        logger.warning(
+            f"config.json: неверное значение duplicate_strategy={strategy!r} "
+            f"(допустимо: {sorted(valid_strategies)})"
+        )
+        return False
     return True
 
 
@@ -264,15 +273,18 @@ def _get_script_files(config: Dict[str, Any]) -> Set[str]:
     return DEFAULT_SCRIPT_FILES.copy()
 
 
-def _is_protected_dir(dirpath: Path) -> bool:
-    """Проверяет, является ли директория защищённой системной (по имени и по абсолютному пути)."""
-    if dirpath.name.lower() in PROTECTED_DIRS:
-        return True
+def is_protected_dir(dirpath: Path) -> bool:
+    """
+    Проверяет, является ли директория защищённой системной.
+
+    Проверка идёт ТОЛЬКО по абсолютному пути (PROTECTED_ABS_PATHS), чтобы избежать
+    ложноположительных срабатываний на обычных пользовательских папках с именами
+    вроде "home", "bin", "tmp" внутри ~/Downloads.
+    """
     try:
         resolved = dirpath.resolve()
         for protected in PROTECTED_ABS_PATHS:
             try:
-                # Совпадение или вложенность в защищённый путь
                 resolved.relative_to(protected)
                 return True
             except ValueError:
@@ -280,6 +292,10 @@ def _is_protected_dir(dirpath: Path) -> bool:
     except (OSError, ValueError):
         pass
     return False
+
+
+# Обратная совместимость: внутреннее имя сохраняем как алиас публичного.
+_is_protected_dir = is_protected_dir
 
 
 def _get_unique_path(
@@ -290,42 +306,44 @@ def _get_unique_path(
     """
     Возвращает путь без конфликта имён, добавляя _1, _2, …
 
+    На case-insensitive ФС (Windows, macOS HFS+/APFS по умолчанию) сравнение
+    идёт без учёта регистра, чтобы "File.TXT" и "file.txt" считались одним
+    и тем же файлом и duplicate_strategy=rename отрабатывала корректно.
+
     Принимает опциональный pre-scanned набор existing_names.
     Если он передан — работает полностью без I/O (O(1) на проверку).
     Если нет — сканирует директорию один раз вместо N вызовов exists().
     """
     target = target_dir / filename
     if existing_names is None:
-        # Сканируем директорию один раз — дешевле N вызовов exists()
         try:
             with os.scandir(target_dir) as it:
                 existing_names = {e.name for e in it}
         except OSError:
             existing_names = set()
 
-    if filename not in existing_names:
+    # На Windows ФС нечувствительна к регистру → нужно сравнивать в lower-case.
+    case_insensitive = os.name == "nt"
+    if case_insensitive:
+        existing_lower = {n.lower() for n in existing_names}
+
+        def _exists(name: str) -> bool:
+            return name.lower() in existing_lower
+    else:
+        def _exists(name: str) -> bool:
+            return name in existing_names
+
+    if not _exists(filename):
         return target
 
     stem, suffix = Path(filename).stem, Path(filename).suffix
     for i in range(1, MAX_UNIQUE_PATH_ATTEMPTS):
         candidate_name = f"{stem}_{i}{suffix}"
-        if candidate_name not in existing_names:
+        if not _exists(candidate_name):
             return target_dir / candidate_name
     raise FileExistsError(
         f"Не удалось найти уникальное имя для {filename} (превышен лимит {MAX_UNIQUE_PATH_ATTEMPTS})"
     )
-
-
-def _file_sha256(path: Path, chunk: int = 65536) -> Optional[str]:
-    """SHA256-хеш файла для обнаружения полных дублей по содержимому."""
-    try:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            while data := f.read(chunk):
-                h.update(data)
-        return h.hexdigest()
-    except IOError:
-        return None
 
 
 def _scan_files_fast(root: Path, recursive: bool) -> List[Tuple[Path, os.stat_result]]:
@@ -371,60 +389,44 @@ def _scan_files_fast(root: Path, recursive: bool) -> List[Tuple[Path, os.stat_re
     return result
 
 
-# ── Асинхронная запись лога отмены ────────────────────────────────────────────
+# ── Запись лога отмены ────────────────────────────────────────────────────────
 
-class _AsyncUndoWriter:
+class _UndoLogWriter:
     """
-    Фоновый поток для пакетной записи лога отмены.
+    Append-only JSONL писатель для undo-лога.
 
-    Основной поток кладёт записи в очередь (неблокирующий submit) и продолжает
-    обрабатывать следующие файлы. Воркер-поток дренирует очередь и записывает
-    на диск пачками, минимизируя число read-modify-write циклов.
-
-    Преимущества:
-    - Основной цикл не блокируется на I/O
-    - При большом числе файлов записи сливаются в одну операцию записи
-    - Частичный прогресс сохраняется на диск даже при прерывании (Ctrl+C)
+    Каждая запись — отдельная строка JSON. Это:
+    - Устраняет O(N²) read-modify-write всего лога на каждый файл.
+    - Не требует фонового потока — нет утечки потоков в режиме мониторинга.
+    - Делает запись потокобезопасной без сложных гонок с undo_last_operation.
+    - Сохраняет частичный прогресс на диск даже при прерывании (Ctrl+C).
     """
 
     def __init__(self, log_path: Path) -> None:
         self._path = log_path
-        self._q: queue.Queue = queue.Queue()
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
+        self._lock = threading.Lock()
 
-    def submit(self, entries: List[Dict]) -> None:
-        """Неблокирующее добавление записей в очередь."""
-        for entry in entries:
-            self._q.put(entry)
-
-    def flush(self, timeout: float = 30.0) -> None:
-        """Ожидаем завершения всех отложенных записей."""
-        self._q.join()
-
-    def _worker(self) -> None:
-        while True:
-            # Блокируемся, пока нет хотя бы одной записи
-            first = self._q.get()
-            batch = [first]
-            # Сразу дренируем всё, что уже накопилось — пишем одним куском
-            while True:
-                try:
-                    batch.append(self._q.get_nowait())
-                except queue.Empty:
-                    break
+    def append(self, entry: Dict) -> None:
+        """Потокобезопасный append одной записи."""
+        with self._lock:
             try:
-                # read-modify-write; держим _lock, чтобы не конкурировать
-                # с undo_last_operation в том же процессе
-                with _lock:
-                    existing = _load_undo_log(self._path.parent)
-                    existing.extend(batch)
-                    _save_undo_log(self._path.parent, existing)
-            except Exception as exc:
-                logger.warning(f"AsyncUndoWriter: ошибка записи: {exc}")
-            finally:
-                for _ in batch:
-                    self._q.task_done()
+                with open(self._path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except IOError as exc:
+                logger.warning(f"Не удалось записать в undo-лог: {exc}")
+
+    def append_many(self, entries: List[Dict]) -> None:
+        """Потокобезопасный пакетный append."""
+        if not entries:
+            return
+        with self._lock:
+            try:
+                with open(self._path, "a", encoding="utf-8") as f:
+                    for entry in entries:
+                        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except IOError as exc:
+                logger.warning(f"Не удалось записать в undo-лог: {exc}")
+
 
 
 # ── Персистентный лог отмены ───────────────────────────────────────────────────
@@ -434,24 +436,61 @@ def _undo_log_path(source_dir: Path) -> Path:
 
 
 def _load_undo_log(source_dir: Path) -> List[Dict[str, Any]]:
+    """
+    Загружает undo-лог.
+
+    Поддерживает два формата для обратной совместимости:
+    - Новый JSONL: одна JSON-запись на строку (append-only).
+    - Старый JSON-массив: один большой массив объектов.
+    """
     path = _undo_log_path(source_dir)
     if not path.exists():
         return []
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return data
+            content = f.read()
+        if not content.strip():
             return []
-    except (json.JSONDecodeError, IOError):
+        # Старый формат: единый JSON-массив (начинается с '[')
+        stripped = content.lstrip()
+        if stripped.startswith("["):
+            try:
+                data = json.loads(content)
+                if isinstance(data, list):
+                    return data
+                return []
+            except json.JSONDecodeError:
+                return []
+        # Новый формат: JSONL
+        entries: List[Dict[str, Any]] = []
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    entries.append(obj)
+            except json.JSONDecodeError:
+                continue  # пропускаем битую строку
+        return entries
+    except IOError:
         return []
 
 
 def _save_undo_log(source_dir: Path, entries: List[Dict]) -> None:
+    """
+    Полностью перезаписывает undo-лог в формате JSONL.
+
+    Используется только undo_last_operation для записи оставшихся entries
+    после частичной отмены. Для добавления новых записей используется
+    _UndoLogWriter.append().
+    """
     path = _undo_log_path(source_dir)
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(entries, f, indent=2, ensure_ascii=False)
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except IOError as exc:
         logger.warning(f"Не удалось сохранить лог отмены: {exc}")
 
@@ -496,6 +535,44 @@ def organize_files(
     if config is None:
         config = load_config()
 
+    # Защита от параллельного запуска: watchdog может срабатывать пока
+    # предыдущая сортировка ещё не закончилась — это вызывает гонки за shutil.move,
+    # mkdir и одновременную запись в undo-лог.
+    if not _organize_lock.acquire(blocking=False):
+        logger.info(
+            "organize_files: предыдущая сортировка ещё выполняется — пропуск "
+            "(новые файлы будут обработаны в следующем цикле)."
+        )
+        return {
+            "moved": 0, "skipped": 0, "errors": 0,
+            "duplicates": 0, "empty_dirs_removed": 0,
+            "by_category": {}, "skipped_concurrent": True,
+        }
+
+    try:
+        return _organize_files_impl(
+            source_dir=source_dir,
+            dry_run=dry_run,
+            verbose=verbose,
+            recursive=recursive,
+            log_callback=log_callback,
+            progress_callback=progress_callback,
+            config=config,
+        )
+    finally:
+        _organize_lock.release()
+
+
+def _organize_files_impl(
+    source_dir: str,
+    dry_run: bool,
+    verbose: bool,
+    recursive: Optional[bool],
+    log_callback: Optional[Callable[[str], None]],
+    progress_callback: Optional[Callable[[int, int], None]],
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Внутренняя реализация organize_files под защитой _organize_lock."""
     settings = config.get("settings", DEFAULT_CONFIG["settings"])
     ext_map = _build_ext_map(config)
     category_names: frozenset = frozenset(config.get("categories", {}).keys())
@@ -541,12 +618,13 @@ def organize_files(
         log("  ⚠  DRY-RUN — файлы НЕ будут перемещены")
     log(f"{'─'*60}\n")
 
+    # lru_cache для _resolve_cached инвалидируем ПЕРЕД сканированием,
+    # чтобы не использовать устаревшие записи (файлы могли быть удалены/переименованы
+    # между вызовами organize_files в режиме мониторинга).
+    _resolve_cached.cache_clear()
+
     # ── Сбор файлов через os.scandir() — получаем stat бесплатно ──────────────
     raw_file_stats: List[Tuple[Path, os.stat_result]] = _scan_files_fast(source_path, use_recursive)
-
-    # lru_cache для _resolve_cached инвалидируем перед новым прогоном,
-    # чтобы не держать устаревшие записи при многократных вызовах в мониторинге
-    _resolve_cached.cache_clear()
 
     # Строим нижний регистр категорий один раз — используем в _should_skip
     category_names_lower: frozenset = frozenset(c.lower() for c in category_names)
@@ -602,7 +680,7 @@ def organize_files(
         batches[category].append((file_path, st))
 
     # Асинхронный писатель лога — submit не блокирует основной цикл
-    undo_writer = _AsyncUndoWriter(_undo_log_path(source_path)) if not use_dry_run else None
+    undo_writer = _UndoLogWriter(_undo_log_path(source_path)) if not use_dry_run else None
 
     # Обрабатываем каждую категорию одним блоком
     for category, batch in batches.items():
@@ -677,9 +755,9 @@ def organize_files(
                         "original_name": file_path.name,
                     }
                     session_log.append(entry)
-                    # Асинхронный submit — основной поток не ждёт записи на диск
+                    # Append в JSONL — потокобезопасно, без read-modify-write
                     if undo_writer:
-                        undo_writer.submit([entry])
+                        undo_writer.append(entry)
 
                     stats["moved"] += 1
                     stats["by_category"][category] += 1
@@ -689,10 +767,8 @@ def organize_files(
                     log(f"  ✗  Ошибка: {masked} — {exc}")
                     stats["errors"] += 1
 
-    # Ждём завершения всех асинхронных записей лога перед выходом
-    if undo_writer:
-        undo_writer.flush()
-    # Синхронизируем in-memory лог сессии
+    # _UndoLogWriter синхронный — отдельный flush не нужен.
+    # Синхронизируем in-memory лог сессии (оставлен для совместимости с тестами)
     if session_log:
         with _lock:
             _action_log.extend(session_log)
