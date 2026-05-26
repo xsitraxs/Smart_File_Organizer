@@ -25,6 +25,7 @@ from organizer_core import (
     _get_unique_path,
     _validate_path_safety,
     get_undo_count,
+    is_protected_dir,
     load_config,
     organize_files,
     undo_last_operation,
@@ -234,8 +235,9 @@ class TestUndoOperation(unittest.TestCase):
         log_path = self.test_dir / UNDO_LOG_FILENAME
         self.assertTrue(log_path.exists())
 
+        # Лог теперь в формате JSONL: одна JSON-запись на строку
         with open(log_path, "r", encoding="utf-8") as f:
-            entries = json.load(f)
+            entries = [json.loads(line) for line in f if line.strip()]
 
         self.assertEqual(len(entries), 2)
         for entry in entries:
@@ -288,6 +290,207 @@ class TestConfigLoading(unittest.TestCase):
         self.assertIn("code", categories)
 
 
+
+class TestDuplicateStrategies(unittest.TestCase):
+    """Тесты duplicate_strategy: skip, replace, rename."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "documents").mkdir()
+        # Файл-исходник
+        (self.test_dir / "report.pdf").write_text("new content")
+        # Файл-уже-там
+        (self.test_dir / "documents" / "report.pdf").write_text("old content")
+
+    def _config_with_strategy(self, strategy: str) -> Dict[str, Any]:
+        import copy
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["duplicate_strategy"] = strategy
+        return cfg
+
+    def test_rename_strategy(self):
+        stats = organize_files(
+            str(self.test_dir), verbose=False,
+            config=self._config_with_strategy("rename"),
+        )
+        # Старый файл сохранился, новый переименован
+        self.assertEqual(
+            (self.test_dir / "documents" / "report.pdf").read_text(), "old content"
+        )
+        self.assertEqual(
+            (self.test_dir / "documents" / "report_1.pdf").read_text(), "new content"
+        )
+        self.assertEqual(stats["duplicates"], 1)
+
+    def test_skip_strategy(self):
+        stats = organize_files(
+            str(self.test_dir), verbose=False,
+            config=self._config_with_strategy("skip"),
+        )
+        # Исходный файл остался на месте
+        self.assertTrue((self.test_dir / "report.pdf").exists())
+        # Старый файл в documents не тронут
+        self.assertEqual(
+            (self.test_dir / "documents" / "report.pdf").read_text(), "old content"
+        )
+        self.assertEqual(stats["skipped"], 1)
+
+    def test_replace_strategy(self):
+        stats = organize_files(
+            str(self.test_dir), verbose=False,
+            config=self._config_with_strategy("replace"),
+        )
+        # Старый файл заменён новым
+        self.assertEqual(
+            (self.test_dir / "documents" / "report.pdf").read_text(), "new content"
+        )
+        # Дубль _1 не должен был появиться
+        self.assertFalse((self.test_dir / "documents" / "report_1.pdf").exists())
+        self.assertEqual(stats["duplicates"], 1)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestProtectedDir(unittest.TestCase):
+    """Тесты проверки защищённых директорий (фикс ложных срабатываний по имени)."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def test_user_folder_named_home_not_protected(self):
+        """Пользовательская папка 'home' внутри tmp НЕ должна считаться защищённой."""
+        fake = self.test_dir / "home"
+        fake.mkdir()
+        self.assertFalse(is_protected_dir(fake))
+
+    def test_user_folder_named_bin_not_protected(self):
+        fake = self.test_dir / "bin"
+        fake.mkdir()
+        self.assertFalse(is_protected_dir(fake))
+
+    def test_user_folder_named_etc_not_protected(self):
+        fake = self.test_dir / "etc"
+        fake.mkdir()
+        self.assertFalse(is_protected_dir(fake))
+
+    def test_real_etc_is_protected(self):
+        """Системные пути по-прежнему защищены."""
+        if os.name == "nt":
+            self.skipTest("Unix-specific")
+        # Не создаём — проверяем именно по абсолютному пути
+        self.assertTrue(is_protected_dir(Path("/etc")))
+        self.assertTrue(is_protected_dir(Path("/usr/bin")))
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestUndoLogFormat(unittest.TestCase):
+    """Тесты нового JSONL-формата undo-лога + обратной совместимости."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "a.txt").write_text("a")
+        (self.test_dir / "b.txt").write_text("b")
+        (self.test_dir / "c.txt").write_text("c")
+
+    def test_jsonl_format(self):
+        """Лог записывается как JSONL: одна запись на строку."""
+        organize_files(str(self.test_dir), verbose=False)
+        log_path = self.test_dir / UNDO_LOG_FILENAME
+        content = log_path.read_text(encoding="utf-8")
+        lines = [l for l in content.splitlines() if l.strip()]
+        self.assertEqual(len(lines), 3)
+        # Каждая строка — валидный JSON-объект
+        for line in lines:
+            obj = json.loads(line)
+            self.assertEqual(obj["action"], "move")
+
+    def test_backward_compat_old_json_array(self):
+        """Старый формат (JSON-массив) читается корректно."""
+        from organizer_core import _load_undo_log
+        log_path = self.test_dir / UNDO_LOG_FILENAME
+        # Эмулируем лог в старом формате
+        old_entries = [
+            {"action": "move", "source": "a.txt", "destination": "documents/a.txt",
+             "original_name": "a.txt", "timestamp": "2026-01-01T00:00:00"},
+            {"action": "move", "source": "b.txt", "destination": "documents/b.txt",
+             "original_name": "b.txt", "timestamp": "2026-01-01T00:00:01"},
+        ]
+        log_path.write_text(json.dumps(old_entries, indent=2), encoding="utf-8")
+        loaded = _load_undo_log(self.test_dir)
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[0]["original_name"], "a.txt")
+
+    def test_corrupted_line_skipped(self):
+        """Битая строка в JSONL не ломает загрузку всего лога."""
+        from organizer_core import _load_undo_log
+        log_path = self.test_dir / UNDO_LOG_FILENAME
+        log_path.write_text(
+            '{"action": "move", "source": "a.txt", "destination": "d/a.txt", "original_name": "a.txt"}\n'
+            'this is not json\n'
+            '{"action": "move", "source": "b.txt", "destination": "d/b.txt", "original_name": "b.txt"}\n',
+            encoding="utf-8",
+        )
+        loaded = _load_undo_log(self.test_dir)
+        self.assertEqual(len(loaded), 2)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestCaseInsensitiveDedup(unittest.TestCase):
+    """Тест case-insensitive проверки имён в _get_unique_path (актуально для Win/macOS)."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def test_case_handling(self):
+        """На Windows file.txt и FILE.TXT считаются одним именем."""
+        existing = {"File.TXT"}
+        result = _get_unique_path(self.test_dir, "file.txt", existing_names=existing)
+        if os.name == "nt":
+            # На Windows должен получить суффикс
+            self.assertEqual(result.name, "file_1.txt")
+        else:
+            # На Linux/macOS-case-sensitive — это разные файлы
+            self.assertEqual(result.name, "file.txt")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestConcurrentOrganize(unittest.TestCase):
+    """Тест защиты от параллельных organize_files (баг с гонками в мониторинге)."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        for i in range(20):
+            (self.test_dir / f"file_{i}.txt").write_text(f"content {i}")
+
+    def test_concurrent_calls_dont_corrupt_log(self):
+        """Два параллельных вызова organize_files не должны повредить undo-лог."""
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(organize_files, str(self.test_dir), verbose=False)
+                for _ in range(4)
+            ]
+            results = [f.result() for f in futures]
+        # Ровно один вызов отработал нормально, остальные были пропущены
+        skipped = [r for r in results if r.get("skipped_concurrent")]
+        worked = [r for r in results if not r.get("skipped_concurrent")]
+        self.assertEqual(len(worked), 1)
+        self.assertGreaterEqual(len(skipped), 0)  # 3 пропущенных
+        # Все 20 файлов перемещены и не дублированы
+        moved_files = list((self.test_dir / "documents").iterdir())
+        self.assertEqual(len(moved_files), 20)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
 def run_tests():
     """Запуск тестов без pytest."""
     loader = unittest.TestLoader()
@@ -300,6 +503,11 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestOrganizeFiles))
     suite.addTests(loader.loadTestsFromTestCase(TestUndoOperation))
     suite.addTests(loader.loadTestsFromTestCase(TestConfigLoading))
+    suite.addTests(loader.loadTestsFromTestCase(TestDuplicateStrategies))
+    suite.addTests(loader.loadTestsFromTestCase(TestProtectedDir))
+    suite.addTests(loader.loadTestsFromTestCase(TestUndoLogFormat))
+    suite.addTests(loader.loadTestsFromTestCase(TestCaseInsensitiveDedup))
+    suite.addTests(loader.loadTestsFromTestCase(TestConcurrentOrganize))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
