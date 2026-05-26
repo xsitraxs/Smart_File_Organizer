@@ -21,7 +21,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from organizer_core import (
-    _is_protected_dir,
+    is_protected_dir,
     get_undo_count,
     load_config,
     organize_files,
@@ -221,7 +221,7 @@ class FileOrganizerApp:
                 return
 
             # Проверка на защищённые системные директории
-            if _is_protected_dir(path_obj):
+            if is_protected_dir(path_obj):
                 messagebox.showerror("Ошибка", "Отказ в открытии защищённой системной директории")
                 return
 
