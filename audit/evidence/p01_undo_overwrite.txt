@@ -1,0 +1,8 @@
+1) organize_files: {'moved': 1, 'skipped': 0, 'errors': 0, 'duplicates': 0, 'empty_dirs_removed': 0, 'by_category': {'documents': 1}}
+   documents/report.txt: ВЕРСИЯ 1 — оригинал, уйдёт в documents/
+2) undo_last_operation: {'restored': 1, 'errors': 0}
+   root/report.txt: ВЕРСИЯ 1 — оригинал, уйдёт в documents/
+   documents/report.txt существует: False
+   остаток undo-лога: 0
+
+РЕЗУЛЬТАТ: ❌ ПОТЕРЯ ДАННЫХ — новый файл затёрт без предупреждения

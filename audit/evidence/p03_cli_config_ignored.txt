@@ -1,0 +1,7 @@
+exit code: 0
+stdout: ''
+stderr: ''
+созданные папки: ['.organizer_undo.json', 'documents']
+
+Ожидалось (если бы --config работал): папка 'notes'.
+РЕЗУЛЬТАТ: ❌ --config полностью игнорируется

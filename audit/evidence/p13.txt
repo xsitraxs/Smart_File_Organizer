@@ -1,0 +1,9 @@
+статистика: {'moved': 3, 'skipped': 0, 'errors': 0, 'duplicates': 0, 'empty_dirs_removed': 2, 'by_category': {'documents': 2, 'audio': 1}}
+
+Documents/contract.pdf отсортирован: False
+   -> файл остался на месте: True
+Music/track.mp3 отсортирован: True
+   -> файл остался на месте: False
+my_notes/todo.txt отсортирован: True
+файл "images" пропущен молча (в skipped не попал): True
+skipped по статистике: 0

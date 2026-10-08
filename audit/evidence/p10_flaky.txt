@@ -1,0 +1,19 @@
+первое падение:
+ F
+======================================================================
+FAIL: test_concurrent_calls_dont_corrupt_log (test_organizer_core.TestConcurrentOrganize.test_concurrent_calls_dont_corrupt_log)
+Два параллельных вызова organize_files не должны повредить undo-лог.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Smart_File_Organizer/test_organizer_core.py", line 484, in test_concurrent_calls_dont_corrupt_log
+    self.assertEqual(len(worked), 1)
+AssertionError: 4 != 1
+
+----------------------------------------------------------------------
+Ran 1 test in 0.009s
+
+FAILED (failures=1)
+
+
+прогонов: 80, падений: 2 (2%)
+РЕЗУЛЬТАТ: ❌ тест нестабилен

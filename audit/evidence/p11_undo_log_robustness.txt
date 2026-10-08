@@ -1,0 +1,3 @@
+get_undo_count: 2 (битая запись считается валидной)
+CRASH: KeyError 'destination'
+файл восстановлен: False

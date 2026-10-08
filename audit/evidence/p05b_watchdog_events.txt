@@ -1,0 +1,11 @@
+события после 'mv файла в папку':
+    ('created', 'photo.jpg', '', 'file')
+    ('modified', 'tmp2mcxgy4a', '', 'dir')
+
+события от собственного перемещения органайзера (существующие папки):
+    ('created', 'images', '', 'dir')
+    ('modified', 'tmp2mcxgy4a', '', 'dir')
+    ('created', 'photo.jpg', '', 'file')
+    ('modified', 'images', '', 'dir')
+    ('deleted', 'photo.jpg', '', 'file')
+    ('modified', 'tmp2mcxgy4a', '', 'dir')

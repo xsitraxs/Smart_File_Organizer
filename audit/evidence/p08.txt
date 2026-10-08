@@ -1,0 +1,3 @@
+organize_files(dry_run=False) со settings.dry_run=True -> {'moved': 1, 'skipped': 0, 'errors': 0, 'duplicates': 0, 'empty_dirs_removed': 0, 'by_category': {'documents': 1}}
+файл на месте: True | папка documents создана: False
+конфиг, который GUI передаст в ядро при СНЯТОЙ галочке dry-run: True -> сортировка снова будет холостой

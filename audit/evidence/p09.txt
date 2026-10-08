@@ -1,0 +1,7 @@
+_get_unique_path с набором {'Report.TXT'} -> report.txt
+(на регистронезависимой ФС Windows/macOS это спасло бы существующий файл)
+stats: {'moved': 1, 'skipped': 0, 'errors': 0, 'duplicates': 0, 'empty_dirs_removed': 1, 'by_category': {'documents': 1}}
+вызовов _get_unique_path из organize_files: []
+в documents/ сейчас: ['Report.TXT', 'report.txt']
+
+РЕЗУЛЬТАТ: ❌ защита от регистра обойдена (spy не вызывался, дубликат не обработан)

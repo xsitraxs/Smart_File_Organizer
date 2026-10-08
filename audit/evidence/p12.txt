@@ -1,0 +1,43 @@
+ДО (структура пользователя):
+   📁 Documents
+     📁 contracts
+          scan.pdf
+   📁 Downloads
+        archive.zip
+   📁 Music
+     📁 album
+          song.mp3
+   📁 Photos
+     📁 2024
+       📁 summer
+            img.jpg
+       📁 winter
+            img2.jpg
+   📁 Projects
+     📁 app
+          README.md
+       📁 src
+            main.py
+
+запуск: organize_files(recursive=True, clean_empty_dirs=True) — как в config.json
+
+статистика: {'moved': 6, 'skipped': 0, 'errors': 0, 'duplicates': 0, 'empty_dirs_removed': 10, 'by_category': {'archives': 1, 'audio': 1, 'images': 2, 'documents': 1, 'code': 1}}
+
+ПОСЛЕ:
+   📁 Documents
+     📁 contracts
+          scan.pdf
+   📁 archives
+        archive.zip
+   📁 audio
+        song.mp3
+   📁 code
+        main.py
+   📁 documents
+        README.md
+   📁 images
+        img.jpg
+        img2.jpg
+
+исходные папки Projects/, Photos/, Documents/, Music/, Downloads/ уничтожены: False
+защита сработала на /home, /root, /tmp, /: False
