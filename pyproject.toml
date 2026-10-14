@@ -1,5 +1,75 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smart-file-organizer"
+version = "1.0.0"
+description = "Умный органайзер файлов — автоматическая сортировка по категориям"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Smart File Organizer contributors" }]
+keywords = ["files", "organizer", "sorting", "automation", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Desktop Environment :: File Managers",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Мгновенная реакция на события ФС в режиме мониторинга.
+# Без watchdog используется polling-режим — всё работает и без него.
+watchdog = ["watchdog>=2.0"]
+# Инфраструктура разработки: тесты, линтер, типы, покрытие.
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "coverage>=7.0",
+]
+
+[project.scripts]
+file-organizer = "file_organizer:main"
+
+[project.gui-scripts]
+file-organizer-gui = "file_organizer_gui:main"
+
+[tool.setuptools]
+py-modules = ["organizer_core", "file_organizer", "file_organizer_gui"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF", "EXE"]
+ignore = [
+    "E501",   # длина строки контролируется вручную (русские комментарии/логи)
+    "RUF001", # кириллические символы в строках — ожидаемо для проекта
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_organizer_core.py" = ["E402", "B011"]
+
 [tool.mypy]
-python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 warn_unused_ignores = true
@@ -13,5 +83,23 @@ pretty = true
 explicit_package_bases = true
 
 [[tool.mypy.overrides]]
+# Тесты намеренно разрешают неполные аннотации
 module = ["test_organizer_core"]
 disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+# watchdog — опциональная зависимость (extras), может отсутствовать
+module = ["watchdog.*"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+branch = true
+source = ["organizer_core", "file_organizer"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    'if __name__ == "__main__":',
+]

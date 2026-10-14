@@ -11,6 +11,7 @@ GUI-версия умного органайзера файлов.
 - Безопасная остановка мониторинга
 """
 
+import contextlib
 import copy
 import os
 import platform
@@ -19,10 +20,11 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from typing import Any, Optional
 
 from organizer_core import (
-    is_protected_dir,
     get_undo_count,
+    is_protected_dir,
     load_config,
     organize_files,
     start_monitoring,
@@ -47,13 +49,18 @@ class FileOrganizerApp:
         self._is_running = False
         self._config = load_config()
 
+        # M10 fix: debounce для чтения undo-журнала — не делаем дисковый I/O
+        # на каждое нажатие клавиши в поле пути
+        self._undo_label_after_id: Optional[str] = None
+        self._undo_count_cache: dict[str, int] = {}
+
         self._build_ui()
 
         # Корректная остановка мониторинга при закрытии окна
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Обновляем счётчик undo при смене пути
-        self.source_path.trace_add("write", lambda *_: self._update_undo_label())
+        # Обновляем счётчик undo при смене пути (с debounce)
+        self.source_path.trace_add("write", self._schedule_undo_label_update)
 
     # ── Построение интерфейса ──────────────────────────────────────────────────
 
@@ -165,17 +172,28 @@ class FileOrganizerApp:
         self._progress["value"] = 0
         self._prog_label.config(text="")
 
-    def _update_undo_label(self) -> None:
+    def _schedule_undo_label_update(self, *_args: Any) -> None:
+        """M10 fix: откладывает обновление счётчика, чтобы не читать
+        undo-журнал на каждое нажатие клавиши в поле пути."""
+        if self._undo_label_after_id is not None:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(self._undo_label_after_id)
+        self._undo_label_after_id = self.root.after(300, self._update_undo_label)
+
+    def _update_undo_label(self, force: bool = False) -> None:
+        self._undo_label_after_id = None
         path = self.source_path.get()
         if not path:
             self._undo_label.config(text="")
             return
         try:
-            n = get_undo_count(path)
-            self._undo_label.config(
-                text=f"({n} оп. для отмены)" if n else "",
-                foreground="gray",
-            )
+            if not force and path in self._undo_count_cache:
+                n = self._undo_count_cache[path]
+            else:
+                n = get_undo_count(path)
+                self._undo_count_cache[path] = n
+            # M10 fix: показываем «0 оп.» вместо пустой строки
+            self._undo_label.config(text=f"({n} оп. для отмены)", foreground="gray")
         except Exception:
             self._undo_label.config(text="")
 
@@ -189,7 +207,9 @@ class FileOrganizerApp:
         self._btn_undo.config(state=tk.NORMAL)
         self._btn_stop.config(state=tk.DISABLED)
         self._is_running = False
-        self._update_undo_label()
+        # Инвалидируем кэш счётчика — журнал мог измениться
+        self._undo_count_cache.clear()
+        self._update_undo_label(force=True)
 
     def _on_close(self) -> None:
         """Корректное завершение: останавливаем мониторинг перед закрытием окна."""
@@ -227,8 +247,13 @@ class FileOrganizerApp:
 
             if platform.system() == "Windows":
                 # os.startfile безопаснее ctypes.windll.shell32.ShellExecuteW:
-                # не подвержен edge cases со специальными символами в пути
-                os.startfile(str(path_obj))
+                # не подвержен edge cases со специальными символами в пути.
+                # getattr — чтобы код проходил mypy/линтеры на не-Windows платформах.
+                startfile = getattr(os, "startfile", None)
+                if startfile is None:  # pragma: no cover - Windows-only ветка
+                    messagebox.showerror("Ошибка", "os.startfile недоступен на этой платформе")
+                    return
+                startfile(str(path_obj))
             elif platform.system() == "Darwin":
                 # subprocess.run вместо Popen для безопасности
                 subprocess.run(["open", str(path_obj)], check=True, timeout=5)
@@ -278,18 +303,31 @@ class FileOrganizerApp:
                 progress_callback=self._set_progress,
                 config=cfg,
             )
-            self._set_status(
-                f"✅ Готово — перемещено: {stats['moved']}, ошибок: {stats['errors']}"
-            )
+            # M6 fix: в dry-run честно сообщаем «будет перемещено», а не «перемещено»
+            if self.is_dry_run.get():
+                self._set_status(
+                    f"🧪 Тестовый режим — будет перемещено: {stats['moved']}, "
+                    f"проблем: {stats['errors']}"
+                )
+                body = (
+                    f"Файлов к перемещению: {stats['moved']}\n"
+                    f"Дубликатов: {stats['duplicates']}\n"
+                    f"Проблем: {stats['errors']}\n\n"
+                    "Ни один файл не был изменён (тестовый режим)."
+                )
+                title = "Тестовый режим завершён"
+            else:
+                self._set_status(
+                    f"✅ Готово — перемещено: {stats['moved']}, ошибок: {stats['errors']}"
+                )
+                body = (
+                    f"Перемещено файлов: {stats['moved']}\n"
+                    f"Дубликатов: {stats['duplicates']}\n"
+                    f"Ошибок: {stats['errors']}"
+                )
+                title = "Готово"
             # messagebox — только из главного потока
-            self.root.after(
-                0,
-                messagebox.showinfo,
-                "Готово",
-                f"Перемещено файлов: {stats['moved']}\n"
-                f"Дубликатов: {stats['duplicates']}\n"
-                f"Ошибок: {stats['errors']}",
-            )
+            self.root.after(0, messagebox.showinfo, title, body)
         except Exception as exc:
             self._log(f"❌ Ошибка: {exc}")
             self._set_status("❌ Ошибка")
@@ -301,6 +339,11 @@ class FileOrganizerApp:
         """Запуск мониторинга."""
         try:
             cfg = copy.deepcopy(self._config)
+            # H6 fix: прокидываем настройки из GUI в мониторинг
+            # (ранее чекбоксы dry-run/recursive игнорировались при мониторинге)
+            cfg["settings"]["dry_run"] = bool(self.is_dry_run.get())
+            cfg["settings"]["recursive"] = bool(self.is_recursive.get())
+
             interval = self.monitor_interval.get()
             self._set_status(f"🔍 Мониторинг активен (интервал {interval} с)")
             self._log(f"🚀 Мониторинг запущен: {path}")
@@ -343,7 +386,8 @@ class FileOrganizerApp:
         try:
             self._set_status("Отмена операций…")
             self._log("\n── Отмена операций ──")
-            stats = undo_last_operation(path, log_callback=self._log)
+            cfg = copy.deepcopy(self._config)
+            stats = undo_last_operation(path, log_callback=self._log, config=cfg)
             self._set_status(
                 f"✅ Отмена завершена — восстановлено: {stats['restored']}, ошибок: {stats['errors']}"
             )

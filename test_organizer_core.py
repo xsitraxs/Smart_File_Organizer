@@ -2,20 +2,24 @@
 """
 Юнит-тесты для organizer_core.py.
 
-Запуск:
-    python -m pytest tests/test_organizer_core.py -v
-
-Или без pytest:
-    python tests/test_organizer_core.py
+Запуск (из корня проекта):
+    python3 -m unittest test_organizer_core
+    python3 test_organizer_core.py
+    pytest test_organizer_core.py -v
 """
 
+import copy
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 from organizer_core import (
     DEFAULT_CONFIG,
@@ -28,6 +32,8 @@ from organizer_core import (
     is_protected_dir,
     load_config,
     organize_files,
+    start_monitoring,
+    stop_monitoring,
     undo_last_operation,
 )
 
@@ -157,7 +163,7 @@ class TestOrganizeFiles(unittest.TestCase):
         (self.test_dir / "organizer_core.py").write_text("# core")
         (self.test_dir / "config.json").write_text("{}")
 
-        stats = organize_files(str(self.test_dir), verbose=False)
+        organize_files(str(self.test_dir), verbose=False)
         # Скрипты не должны перемещаться
         self.assertTrue((self.test_dir / "organizer_core.py").exists())
         self.assertTrue((self.test_dir / "config.json").exists())
@@ -236,7 +242,7 @@ class TestUndoOperation(unittest.TestCase):
         self.assertTrue(log_path.exists())
 
         # Лог теперь в формате JSONL: одна JSON-запись на строку
-        with open(log_path, "r", encoding="utf-8") as f:
+        with open(log_path, encoding="utf-8") as f:
             entries = [json.loads(line) for line in f if line.strip()]
 
         self.assertEqual(len(entries), 2)
@@ -257,7 +263,7 @@ class TestUndoOperation(unittest.TestCase):
 
         # Эмулируем полный сброс состояния (как после перезапуска)
         # В реальном сценарии это происходит автоматически благодаря персистентному логу
-        from organizer_core import _action_log, _load_undo_log
+        from organizer_core import _action_log
         _action_log.clear()  # Очищаем in-memory лог
 
         # Отмена должна работать из персистентного лога
@@ -302,7 +308,7 @@ class TestDuplicateStrategies(unittest.TestCase):
         # Файл-уже-там
         (self.test_dir / "documents" / "report.pdf").write_text("old content")
 
-    def _config_with_strategy(self, strategy: str) -> Dict[str, Any]:
+    def _config_with_strategy(self, strategy: str) -> dict[str, Any]:
         import copy
         cfg = copy.deepcopy(DEFAULT_CONFIG)
         cfg["settings"]["duplicate_strategy"] = strategy
@@ -400,7 +406,7 @@ class TestUndoLogFormat(unittest.TestCase):
         organize_files(str(self.test_dir), verbose=False)
         log_path = self.test_dir / UNDO_LOG_FILENAME
         content = log_path.read_text(encoding="utf-8")
-        lines = [l for l in content.splitlines() if l.strip()]
+        lines = [line for line in content.splitlines() if line.strip()]
         self.assertEqual(len(lines), 3)
         # Каждая строка — валидный JSON-объект
         for line in lines:
@@ -447,15 +453,47 @@ class TestCaseInsensitiveDedup(unittest.TestCase):
         self.test_dir = Path(tempfile.mkdtemp())
 
     def test_case_handling(self):
-        """На Windows file.txt и FILE.TXT считаются одним именем."""
+        """На case-insensitive ФС (Windows, macOS) file.txt и FILE.TXT — одно имя (M9)."""
+        from organizer_core import _fs_is_case_insensitive
+
         existing = {"File.TXT"}
         result = _get_unique_path(self.test_dir, "file.txt", existing_names=existing)
-        if os.name == "nt":
-            # На Windows должен получить суффикс
+        if _fs_is_case_insensitive():
+            # Windows/macOS: должен получить суффикс
             self.assertEqual(result.name, "file_1.txt")
         else:
-            # На Linux/macOS-case-sensitive — это разные файлы
+            # Linux (case-sensitive) — это разные файлы
             self.assertEqual(result.name, "file.txt")
+
+    def test_lower_set_is_used_when_provided(self):
+        """Переданный lower-case набор используется без пересчёта (M9)."""
+        existing = {"File.TXT"}
+        lower = {"file.txt"}
+        result = _get_unique_path(
+            self.test_dir,
+            "file.txt",
+            existing_names=existing,
+            existing_names_lower=lower,
+        )
+        # Без учёта регистра имя занято → суффикс; проверяем именно ветку
+        from organizer_core import _fs_is_case_insensitive
+
+        self.assertEqual(
+            result.name,
+            "file_1.txt" if _fs_is_case_insensitive() else "file.txt",
+        )
+
+    def test_helpers_case_aware(self):
+        """_name_in_set/_add_name учитывают регистр только на CI-ФС (M9)."""
+        from organizer_core import _add_name, _name_in_set
+
+        names: set = set()
+        lowers: set = set()
+        _add_name("Photo.JPG", names, lowers, True)
+        self.assertIn("Photo.JPG", names)
+        self.assertIn("photo.jpg", lowers)
+        self.assertTrue(_name_in_set("photo.jpg", names, lowers, True))
+        self.assertFalse(_name_in_set("photo.jpg", names, lowers, False))
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
@@ -470,7 +508,18 @@ class TestConcurrentOrganize(unittest.TestCase):
             (self.test_dir / f"file_{i}.txt").write_text(f"content {i}")
 
     def test_concurrent_calls_dont_corrupt_log(self):
-        """Два параллельных вызова organize_files не должны повредить undo-лог."""
+        """
+        Параллельные вызовы organize_files не должны повредить undo-лог.
+
+        M3 fix: тест проверяет ИНВАРИАНТ, а не тайминг. Ранее он требовал,
+        чтобы ровно один вызов «отработал», и падал, когда потоки успевали
+        выполниться последовательно (0 файлов у одного из них) — флаки.
+        Корректный инвариант:
+        - суммарно перемещены все 20 файлов ровно один раз;
+        - undo-журнал содержит ровно 20 записей без дублей;
+        - не осталось файлов в корне папки;
+        - ни один вызов не вернул повреждённую статистику.
+        """
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures = [
@@ -478,36 +527,970 @@ class TestConcurrentOrganize(unittest.TestCase):
                 for _ in range(4)
             ]
             results = [f.result() for f in futures]
-        # Ровно один вызов отработал нормально, остальные были пропущены
-        skipped = [r for r in results if r.get("skipped_concurrent")]
-        worked = [r for r in results if not r.get("skipped_concurrent")]
-        self.assertEqual(len(worked), 1)
-        self.assertGreaterEqual(len(skipped), 0)  # 3 пропущенных
-        # Все 20 файлов перемещены и не дублированы
-        moved_files = list((self.test_dir / "documents").iterdir())
+
+        # Каждый вызов вернул валидную статистику, безотносительно тайминга
+        for r in results:
+            for key in ("moved", "skipped", "errors", "duplicates"):
+                self.assertIn(key, r)
+                self.assertIsInstance(r[key], int)
+
+        # Инвариант №1: все 20 файлов перемещены ровно один раз
+        total_moved = sum(r["moved"] for r in results)
+        self.assertEqual(total_moved, 20)
+
+        # Инвариант №2: в целевой папке ровно 20 уникальных файлов
+        moved_files = sorted((self.test_dir / "documents").iterdir())
         self.assertEqual(len(moved_files), 20)
+        self.assertEqual(len({f.name for f in moved_files}), 20)
+
+        # Инвариант №3: в корне не осталось необработанных файлов
+        leftover = [
+            p.name for p in self.test_dir.iterdir()
+            if p.is_file() and p.name != UNDO_LOG_FILENAME
+        ]
+        self.assertEqual(leftover, [])
+
+        # Инвариант №4: undo-журнал содержит ровно 20 записей, все валидные
+        from organizer_core import _load_undo_log
+        entries = _load_undo_log(self.test_dir)
+        self.assertEqual(len(entries), 20)
+        for entry in entries:
+            self.assertEqual(entry.get("action"), "move")
+            self.assertIn("source", entry)
+            self.assertIn("destination", entry)
+        # Ни одна запись не дублируется по целевому пути
+        destinations = [e["destination"] for e in entries]
+        self.assertEqual(len(destinations), len(set(destinations)))
+
+        # Инвариант №5: полный undo полностью откатывает сортировку
+        undo_stats = undo_last_operation(str(self.test_dir), verbose=False)
+        self.assertEqual(undo_stats["restored"], 20)
+        for i in range(20):
+            self.assertTrue((self.test_dir / f"file_{i}.txt").exists())
+
+    def test_different_dirs_do_not_block_each_other(self):
+        """M4: блокировка по папке — сортировка dir2 не блокируется сортировкой dir1."""
+        import concurrent.futures
+
+        dir1 = Path(tempfile.mkdtemp())
+        dir2 = Path(tempfile.mkdtemp())
+        try:
+            for d in (dir1, dir2):
+                for i in range(10):
+                    (d / f"f_{i}.txt").write_text("x")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                f1 = pool.submit(organize_files, str(dir1), verbose=False)
+                f2 = pool.submit(organize_files, str(dir2), verbose=False)
+                r1, r2 = f1.result(), f2.result()
+
+            # Ни один из вызовов не должен быть «пропущен из-за конкурентности»
+            self.assertFalse(r1.get("skipped_concurrent", False))
+            self.assertFalse(r2.get("skipped_concurrent", False))
+            self.assertEqual(r1["moved"], 10)
+            self.assertEqual(r2["moved"], 10)
+        finally:
+            shutil.rmtree(dir1, ignore_errors=True)
+            shutil.rmtree(dir2, ignore_errors=True)
+
+    def test_concurrent_organize_and_undo_safe(self):
+        """M2: одновременные organize и undo не должны повреждать журнал."""
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(organize_files, str(self.test_dir), verbose=False),
+                pool.submit(undo_last_operation, str(self.test_dir), -1, False),
+                pool.submit(organize_files, str(self.test_dir), verbose=False),
+                pool.submit(undo_last_operation, str(self.test_dir), -1, False),
+            ]
+            # Ни один вызов не должен выбросить исключение
+            for f in futures:
+                f.result()
+
+        # Журнал либо пуст, либо содержит только валидные записи
+        from organizer_core import _load_undo_log
+        entries = _load_undo_log(self.test_dir)
+        for entry in entries:
+            self.assertEqual(entry.get("action"), "move")
+            self.assertIn("source", entry)
+            self.assertIn("destination", entry)
+
+        # Суммарно все 20 файлов на месте: либо в корне, либо в категории — без потерь
+        in_root = {
+            p.name for p in self.test_dir.iterdir()
+            if p.is_file() and p.name != UNDO_LOG_FILENAME
+        }
+        in_docs = (
+            {p.name for p in (self.test_dir / "documents").iterdir()}
+            if (self.test_dir / "documents").exists()
+            else set()
+        )
+        self.assertEqual(len(in_root | in_docs), 20)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
 
+class TestCategoryResort(unittest.TestCase):
+    """Тесты M1: файлы внутри папок-категорий пересортируются по факту."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def test_miscategorized_file_resorted(self):
+        """photo.jpg внутри videos/ должен переехать в images/ (M1)."""
+        (self.test_dir / "videos").mkdir()
+        (self.test_dir / "videos" / "photo.jpg").write_text("jpg")
+
+        stats = organize_files(str(self.test_dir), verbose=False)
+        self.assertEqual(stats["moved"], 1)
+        self.assertTrue((self.test_dir / "images" / "photo.jpg").exists())
+        self.assertFalse((self.test_dir / "videos" / "photo.jpg").exists())
+
+    def test_correctly_placed_file_not_touched(self):
+        """Файл в своей категории (в т.ч. во вложенной папке) не трогается (M1)."""
+        (self.test_dir / "documents" / "sub").mkdir(parents=True)
+        (self.test_dir / "documents" / "sub" / "note.txt").write_text("txt")
+        (self.test_dir / "audio").mkdir()
+        (self.test_dir / "audio" / "song.mp3").write_text("mp3")
+
+        stats = organize_files(str(self.test_dir), verbose=False)
+        self.assertEqual(stats["moved"], 0)
+        self.assertTrue((self.test_dir / "documents" / "sub" / "note.txt").exists())
+        self.assertTrue((self.test_dir / "audio" / "song.mp3").exists())
+
+    def test_second_run_is_noop(self):
+        """Повторный прогон не должен «пинг-понговать» файлами (M1)."""
+        (self.test_dir / "videos").mkdir()
+        (self.test_dir / "videos" / "photo.jpg").write_text("jpg")
+        organize_files(str(self.test_dir), verbose=False)
+
+        stats2 = organize_files(str(self.test_dir), verbose=False)
+        self.assertEqual(stats2["moved"], 0)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestUndoCountValidation(unittest.TestCase):
+    """Тесты валидации count в undo_last_operation (C2)."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "a.txt").write_text("a")
+        (self.test_dir / "b.txt").write_text("b")
+        organize_files(str(self.test_dir), verbose=False)
+
+    def test_undo_count_zero_restores_nothing(self):
+        """count=0 не должен отменять НИЧЕГО и не портить журнал (C2)."""
+        before = get_undo_count(str(self.test_dir))
+        stats = undo_last_operation(str(self.test_dir), count=0, verbose=False)
+        self.assertEqual(stats["restored"], 0)
+        self.assertEqual(stats["errors"], 0)
+        # Журнал должен остаться нетронутым
+        self.assertEqual(get_undo_count(str(self.test_dir)), before)
+        # Файлы всё ещё в категории
+        self.assertTrue((self.test_dir / "documents" / "a.txt").exists())
+
+    def test_undo_negative_other_than_minus_one_is_noop(self):
+        """count=-5 не должен молча ничего делать с порчей состояния (C2)."""
+        before = get_undo_count(str(self.test_dir))
+        stats = undo_last_operation(str(self.test_dir), count=-5, verbose=False)
+        self.assertEqual(stats["restored"], 0)
+        self.assertEqual(get_undo_count(str(self.test_dir)), before)
+
+    def test_undo_count_greater_than_available(self):
+        """count > доступных операций отменяет все доступные (C2)."""
+        stats = undo_last_operation(str(self.test_dir), count=999, verbose=False)
+        self.assertEqual(stats["restored"], 2)
+        self.assertEqual(get_undo_count(str(self.test_dir)), 0)
+
+    def test_undo_minus_one_restores_all(self):
+        """count=-1 по-прежнему отменяет всё (C2)."""
+        stats = undo_last_operation(str(self.test_dir), count=-1, verbose=False)
+        self.assertEqual(stats["restored"], 2)
+        self.assertEqual(get_undo_count(str(self.test_dir)), 0)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestUndoDoesNotOverwrite(unittest.TestCase):
+    """Тесты защиты от перезаписи файлов при undo (C3)."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def test_undo_does_not_overwrite_new_user_file(self):
+        """Undo не должен молча затирать новый файл на исходном месте (C3)."""
+        (self.test_dir / "a.txt").write_text("ORIGINAL")
+        organize_files(str(self.test_dir), verbose=False)
+
+        # Пользователь создал новый файл с тем же именем
+        (self.test_dir / "a.txt").write_text("NEW USER FILE")
+
+        stats = undo_last_operation(str(self.test_dir), verbose=False)
+        self.assertEqual(stats["restored"], 1)
+        self.assertEqual(stats["errors"], 0)
+
+        # Новый файл НЕ должен быть перезаписан
+        self.assertEqual((self.test_dir / "a.txt").read_text(), "NEW USER FILE")
+        # Старый файл должен быть восстановлен под другим именем
+        candidates = [
+            p for p in self.test_dir.iterdir()
+            if p.is_file() and p.name not in ("a.txt", UNDO_LOG_FILENAME)
+        ]
+        self.assertTrue(candidates, "Восстановленный файл не найден")
+        self.assertEqual(candidates[0].read_text(), "ORIGINAL")
+
+    def test_undo_skip_strategy_leaves_both(self):
+        """При duplicate_strategy=skip undo не трогает существующий файл (C3)."""
+        import copy as _copy
+        cfg = _copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["duplicate_strategy"] = "skip"
+
+        (self.test_dir / "a.txt").write_text("ORIGINAL")
+        organize_files(str(self.test_dir), verbose=False, config=cfg)
+        (self.test_dir / "a.txt").write_text("NEW USER FILE")
+
+        stats = undo_last_operation(
+            str(self.test_dir), verbose=False, config=cfg
+        )
+        # Файл не восстановлен (пропущен) — но и не потерян
+        self.assertEqual((self.test_dir / "a.txt").read_text(), "NEW USER FILE")
+        self.assertEqual(stats["errors"], 1)
+        # Неудачная запись остаётся в журнале для повторной попытки
+        self.assertGreaterEqual(get_undo_count(str(self.test_dir)), 1)
+
+    def test_undo_restores_normally_when_no_conflict(self):
+        """Обычный undo без конфликта продолжает работать."""
+        (self.test_dir / "a.txt").write_text("ORIGINAL")
+        organize_files(str(self.test_dir), verbose=False)
+        stats = undo_last_operation(str(self.test_dir), verbose=False)
+        self.assertEqual(stats["restored"], 1)
+        self.assertEqual((self.test_dir / "a.txt").read_text(), "ORIGINAL")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestMalformedUndoEntries(unittest.TestCase):
+    """Тесты устойчивости undo к семантически неполным записям (H4)."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "a.txt").write_text("a")
+
+    def test_entry_without_destination_skipped(self):
+        """Запись без destination не должна ронять undo с KeyError (H4)."""
+        log_path = self.test_dir / UNDO_LOG_FILENAME
+        log_path.write_text(
+            '{"action": "move", "source": "a.txt", "original_name": "a.txt"}\n',
+            encoding="utf-8",
+        )
+        stats = undo_last_operation(str(self.test_dir), verbose=False)
+        self.assertEqual(stats["errors"], 1)
+        self.assertEqual(stats["restored"], 0)
+
+    def test_entry_without_source_skipped(self):
+        """Запись без source не должна ронять undo (H4)."""
+        log_path = self.test_dir / UNDO_LOG_FILENAME
+        log_path.write_text(
+            '{"action": "move", "destination": "documents/a.txt", "original_name": "a.txt"}\n',
+            encoding="utf-8",
+        )
+        stats = undo_last_operation(str(self.test_dir), verbose=False)
+        self.assertEqual(stats["errors"], 1)
+
+    def test_valid_entries_processed_alongside_broken(self):
+        """Валидные записи обрабатываются, несмотря на битую."""
+        (self.test_dir / "b.pdf").write_text("b")
+        organize_files(str(self.test_dir), verbose=False)
+        # Дописываем битую запись в конец
+        log_path = self.test_dir / UNDO_LOG_FILENAME
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write('{"action": "move", "original_name": "broken"}\n')
+        stats = undo_last_operation(str(self.test_dir), verbose=False)
+        self.assertEqual(stats["restored"], 2)
+        self.assertEqual(stats["errors"], 1)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestCategorySafety(unittest.TestCase):
+    """Тесты безопасности имён категорий и целей (H1)."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def test_category_name_traversal_rejected_by_schema(self):
+        """Имя категории с '..' не проходит валидацию схемы (H1)."""
+        from organizer_core import _validate_config_schema
+        cfg = {
+            "categories": {"../escaped": ["pdf"]},
+            "settings": {},
+        }
+        self.assertFalse(_validate_config_schema(cfg))
+
+    def test_category_name_absolute_path_rejected(self):
+        """Абсолютный путь как имя категории отклоняется (H1)."""
+        from organizer_core import _validate_config_schema
+        cfg = {"categories": {"/tmp/escaped": ["pdf"]}, "settings": {}}
+        self.assertFalse(_validate_config_schema(cfg))
+
+    def test_category_name_with_slash_rejected(self):
+        """Имя категории со слешем отклоняется (H1)."""
+        from organizer_core import _validate_config_schema
+        cfg = {"categories": {"sub/dir": ["pdf"]}, "settings": {}}
+        self.assertFalse(_validate_config_schema(cfg))
+
+    def test_normal_category_names_accepted(self):
+        """Обычные имена категорий проходят валидацию."""
+        from organizer_core import _validate_config_schema
+        self.assertTrue(_validate_config_schema(DEFAULT_CONFIG))
+
+    def test_symlink_category_dir_does_not_escape(self):
+        """Симлинк-категория наружу не должна уводить файлы за пределы папки (H1)."""
+        outside = Path(tempfile.mkdtemp())
+        try:
+            (self.test_dir / "documents").symlink_to(outside)
+            (self.test_dir / "report.pdf").write_text("PDF")
+            stats = organize_files(str(self.test_dir), verbose=False)
+            self.assertEqual(stats["moved"], 0)
+            self.assertGreaterEqual(stats["errors"], 1)
+            # Ничего не должно оказаться снаружи
+            self.assertEqual(list(outside.iterdir()), [])
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestCategoryDirBlockedByFile(unittest.TestCase):
+    """Тест H3: файл с именем категории не должен ронять весь прогон."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def test_run_continues_when_category_dir_blocked(self):
+        """Файл 'other' блокирует категорию other, остальные обрабатываются (H3).
+
+        Файл без расширения с именем категории сам попадает в категорию `other`
+        и пытается создать папку `other` — mkdir падает с FileExistsError.
+        Прогон обязан продолжиться, посчитав ошибку, а не прерваться.
+        """
+        (self.test_dir / "other").write_text("blocker-file")
+        (self.test_dir / "unknown.xyz").write_text("unknown")  # → other (заблокировано)
+        (self.test_dir / "photo.jpg").write_text("JPG")        # → images (работает)
+
+        stats = organize_files(str(self.test_dir), verbose=False)
+        # Прогон не упал, статистика вернулась
+        self.assertIsInstance(stats, dict)
+        # Картинка обработана
+        self.assertTrue((self.test_dir / "images" / "photo.jpg").exists())
+        # Ошибка по заблокированной категории посчитана
+        self.assertGreaterEqual(stats["errors"], 1)
+        # Файл-блокер цел, неперемещённый файл тоже
+        self.assertEqual((self.test_dir / "other").read_text(), "blocker-file")
+        self.assertTrue((self.test_dir / "unknown.xyz").exists())
+
+    def test_file_named_category_is_not_falsely_skipped(self):
+        """Файл в корне с именем категории сортируется, а не молча пропускается (M1)."""
+        (self.test_dir / "documents").write_text("not a folder")
+        stats = organize_files(str(self.test_dir), verbose=False)
+        # Файл без расширения → other; не должен «залипнуть» из-за имени
+        self.assertEqual(stats["moved"], 1)
+        self.assertTrue((self.test_dir / "other" / "documents").exists())
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestReplaceStrategyReversible(unittest.TestCase):
+    """Тест H2: replace создаёт бэкап, заменённый файл не теряется."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "documents").mkdir()
+        (self.test_dir / "documents" / "report.pdf").write_text("OLD CONTENT")
+        (self.test_dir / "report.pdf").write_text("NEW CONTENT")
+
+    def _cfg(self, strategy: str) -> dict[str, Any]:
+        import copy as _copy
+        cfg = _copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["duplicate_strategy"] = strategy
+        return cfg
+
+    def test_replace_creates_backup(self):
+        """При replace старый файл не уничтожается, а сохраняется как бэкап (H2)."""
+        stats = organize_files(
+            str(self.test_dir), verbose=False, config=self._cfg("replace")
+        )
+        self.assertEqual(stats["duplicates"], 1)
+        self.assertEqual(
+            (self.test_dir / "documents" / "report.pdf").read_text(), "NEW CONTENT"
+        )
+        backups = list((self.test_dir / "documents").glob("report.pdf.bak-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), "OLD CONTENT")
+
+    def test_replace_backup_recorded_in_undo_log(self):
+        """Информация о бэкапе записывается в undo-журнал (H2)."""
+        organize_files(str(self.test_dir), verbose=False, config=self._cfg("replace"))
+        from organizer_core import _load_undo_log
+        entries = _load_undo_log(self.test_dir)
+        backup_entries = [e for e in entries if e.get("action") == "backup"]
+        self.assertEqual(len(backup_entries), 1)
+        self.assertIn("report.pdf.bak-", backup_entries[0]["source"])
+
+    def test_replace_is_fully_reversible_by_undo(self):
+        """Полный undo после replace возвращает и старый, и новый файл (H2)."""
+        organize_files(
+            str(self.test_dir), verbose=False, config=self._cfg("replace")
+        )
+        stats = undo_last_operation(
+            str(self.test_dir), verbose=False, config=self._cfg("replace")
+        )
+        # Восстановлены оба: и перемещённый файл, и заменённый (из бэкапа)
+        self.assertEqual(stats["restored"], 2)
+        self.assertEqual(stats["errors"], 0)
+
+        self.assertEqual((self.test_dir / "report.pdf").read_text(), "NEW CONTENT")
+        self.assertEqual(
+            (self.test_dir / "documents" / "report.pdf").read_text(), "OLD CONTENT"
+        )
+        # Бэкап-файл не остаётся мусором
+        self.assertEqual(list((self.test_dir / "documents").glob("*.bak-*")), [])
+
+    def test_replace_partial_undo_keeps_backup(self):
+        """Частичный undo (только move) не теряет бэкап и не ломает журнал (H2)."""
+        organize_files(
+            str(self.test_dir), verbose=False, config=self._cfg("replace")
+        )
+        # Отменяем только последнюю операцию (перемещение нового файла)
+        undo_last_operation(
+            str(self.test_dir), count=1, verbose=False, config=self._cfg("replace")
+        )
+        # Бэкап остался на месте — данные не потеряны
+        backups = list((self.test_dir / "documents").glob("report.pdf.bak-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), "OLD CONTENT")
+
+        # Повторный полный undo доводит восстановление до конца
+        stats = undo_last_operation(
+            str(self.test_dir), verbose=False, config=self._cfg("replace")
+        )
+        self.assertEqual(stats["restored"], 1)
+        self.assertEqual(
+            (self.test_dir / "documents" / "report.pdf").read_text(), "OLD CONTENT"
+        )
+
+    def test_two_replaces_same_second_keep_both_backups(self):
+        """Два replace за одну секунду не должны затирать бэкапы друг друга (H2).
+
+        Порядок обработки файлов недетерминирован (стековый обход), поэтому
+        проверяем инвариант сохранности данных: содержимое всех трёх файлов
+        (заменённого и обоих источников) должно присутствовать на диске.
+        """
+        sub = self.test_dir / "sub"
+        sub.mkdir()
+        # Второй файл с тем же именем, который тоже попадёт в documents/
+        (self.test_dir / "documents" / "report.pdf").write_text("OLD CONTENT")
+        (sub / "report.pdf").write_text("SECOND CONTENT")
+
+        stats = organize_files(
+            str(self.test_dir), verbose=False, config=self._cfg("replace")
+        )
+        self.assertEqual(stats["errors"], 0)
+
+        backups = sorted((self.test_dir / "documents").glob("report.pdf*.bak-*"))
+        # Каждый replace сохранил свой бэкап: два файла + текущий = три содержимых
+        self.assertEqual(len(backups), 2)
+        contents = {b.read_text() for b in backups}
+        contents.add((self.test_dir / "documents" / "report.pdf").read_text())
+        self.assertEqual(contents, {"OLD CONTENT", "SECOND CONTENT", "NEW CONTENT"})
+
+    def test_double_replace_fully_reversible(self):
+        """Полный undo после двух replace восстанавливает исходное состояние (H2)."""
+        sub = self.test_dir / "sub"
+        sub.mkdir()
+        (self.test_dir / "documents" / "report.pdf").write_text("OLD CONTENT")
+        (sub / "report.pdf").write_text("SECOND CONTENT")
+
+        organize_files(
+            str(self.test_dir), verbose=False, config=self._cfg("replace")
+        )
+        undo_last_operation(
+            str(self.test_dir), verbose=False, config=self._cfg("replace")
+        )
+
+        self.assertEqual((self.test_dir / "report.pdf").read_text(), "NEW CONTENT")
+        self.assertEqual((sub / "report.pdf").read_text(), "SECOND CONTENT")
+        self.assertEqual(
+            (self.test_dir / "documents" / "report.pdf").read_text(), "OLD CONTENT"
+        )
+        self.assertEqual(list((self.test_dir / "documents").glob("*.bak-*")), [])
+
+    def test_replace_without_existing_file_still_works(self):
+        """Обычный replace без бэкапа (файла не было) работает как раньше."""
+        (self.test_dir / "documents" / "report.pdf").unlink()
+        stats = organize_files(
+            str(self.test_dir), verbose=False, config=self._cfg("replace")
+        )
+        self.assertEqual(stats["moved"], 1)
+        self.assertEqual(
+            (self.test_dir / "documents" / "report.pdf").read_text(), "NEW CONTENT"
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestConfigValidation(unittest.TestCase):
+    """Тесты валидации конфига (H4)."""
+
+    def test_non_dict_config_rejected(self):
+        """Конфиг-массив не проходит валидацию (H4)."""
+        from organizer_core import _validate_config_schema
+        self.assertFalse(_validate_config_schema(["not a dict"]))
+
+    def test_category_exts_must_be_list(self):
+        """Строка вместо списка расширений отклоняется (H4)."""
+        from organizer_core import _validate_config_schema
+        cfg = {"categories": {"images": "jpg"}, "settings": {}}
+        self.assertFalse(_validate_config_schema(cfg))
+
+    def test_category_exts_must_be_strings(self):
+        """Нестроковые расширения отклоняются (H4)."""
+        from organizer_core import _validate_config_schema
+        cfg = {"categories": {"images": [123]}, "settings": {}}
+        self.assertFalse(_validate_config_schema(cfg))
+
+    def test_invalid_strategy_rejected(self):
+        """Невалидная duplicate_strategy отклоняется (H4)."""
+        from organizer_core import _validate_config_schema
+        cfg = {"categories": {"other": []}, "settings": {"duplicate_strategy": "xyz"}}
+        self.assertFalse(_validate_config_schema(cfg))
+
+    def test_invalid_max_file_size_rejected(self):
+        """Строковый max_file_size отклоняется (H4)."""
+        from organizer_core import _validate_config_schema
+        cfg = {"categories": {"other": []}, "settings": {"max_file_size": "1GB"}}
+        self.assertFalse(_validate_config_schema(cfg))
+
+    def test_invalid_config_param_raises(self):
+        """Невалидный config, переданный параметром, не должен молча игнорироваться (H4)."""
+        with tempfile.TemporaryDirectory() as d:
+            test_dir = Path(d)
+            (test_dir / "a.txt").write_text("a")
+            bad_cfg = {"categories": {"images": "jpg"}, "settings": {}}
+            with self.assertRaises(ValueError):
+                organize_files(str(test_dir), verbose=False, config=bad_cfg)
+
+    def test_organize_rejects_protected_dir(self):
+        """H5: корень ФС запрещён как рабочая директория."""
+        if os.name == "nt":
+            self.skipTest("Unix-specific")
+        with self.assertRaises(ValueError):
+            organize_files("/", verbose=False)
+
+
+class TestProtectedDirHardening(unittest.TestCase):
+    """Тесты H5: защита корня ФС, /root, домашнего каталога."""
+
+    def test_root_is_protected(self):
+        if os.name == "nt":
+            self.skipTest("Unix-specific")
+        self.assertTrue(is_protected_dir(Path("/")))
+
+    def test_home_root_is_protected(self):
+        """H5: /home защищён как цель."""
+        if os.name == "nt":
+            self.skipTest("Unix-specific")
+        self.assertTrue(is_protected_dir(Path("/home")))
+
+    def test_user_home_is_protected(self):
+        """H5: домашний каталог пользователя защищён."""
+        self.assertTrue(is_protected_dir(Path.home()))
+
+    def test_user_subdirectory_not_protected(self):
+        """H5: обычные пользовательские подпапки НЕ защищены."""
+        if os.name == "nt":
+            self.skipTest("Unix-specific")
+        with tempfile.TemporaryDirectory() as d:
+            sub = Path(d) / "sub"
+            sub.mkdir()
+            self.assertFalse(is_protected_dir(sub))
+
+    def test_tmp_subdir_not_protected(self):
+        """H5: подпапки /tmp — пользовательские, не защищены."""
+        if os.name == "nt":
+            self.skipTest("Unix-specific")
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(is_protected_dir(Path(d)))
+
+
+class TestMonitoring(unittest.TestCase):
+    """Тесты мониторинга (H6) — настройки, старт/стоп без утечек."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        self.logs: list = []
+
+    def _cb(self, msg: str) -> None:
+        self.logs.append(msg)
+
+    def test_start_stop_polling_completes(self):
+        """Мониторинг в polling-режиме запускается и останавливается полностью (H6)."""
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["use_watchdog"] = False
+
+        t = start_monitoring(
+            str(self.test_dir), interval=1, callback=self._cb, config=cfg
+        )
+        self.assertTrue(t.is_alive())
+        stop_monitoring()
+        self.assertFalse(t.is_alive(), "Поток мониторинга не был остановлен")
+
+    def test_config_none_does_not_force_watchdog(self):
+        """start_monitoring(config=None) читает use_watchdog из конфига (H6)."""
+        # Не должно бросать исключений даже без watchdog
+        t = start_monitoring(str(self.test_dir), interval=1, callback=self._cb)
+        stop_monitoring()
+        self.assertFalse(t.is_alive())
+
+    def test_polling_reacts_to_new_file(self):
+        """Polling-мониторинг замечает новые файлы и сортирует их (H6)."""
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["use_watchdog"] = False
+
+        start_monitoring(str(self.test_dir), interval=1, callback=self._cb, config=cfg)
+        try:
+            (self.test_dir / "new_photo.jpg").write_text("JPG")
+            deadline = time.time() + 15
+            moved = False
+            while time.time() < deadline:
+                if (self.test_dir / "images" / "new_photo.jpg").exists():
+                    moved = True
+                    break
+                time.sleep(0.25)
+            self.assertTrue(moved, f"Новый файл не отсортирован. Логи: {self.logs}")
+        finally:
+            stop_monitoring()
+
+    def test_stop_cancels_pending_sort(self):
+        """После stop_monitoring отложенная сортировка не выполняется (H6)."""
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["use_watchdog"] = False
+
+        start_monitoring(str(self.test_dir), interval=1, callback=self._cb, config=cfg)
+        (self.test_dir / "late_photo.jpg").write_text("JPG")
+        stop_monitoring()
+
+        # Даём время любому «хвосту» мониторинга выполниться
+        time.sleep(2.5)
+        self.assertFalse(
+            (self.test_dir / "images" / "late_photo.jpg").exists(),
+            "Сортировка запустилась после остановки мониторинга",
+        )
+
+    def test_debounce_scheduler_collapses_events(self):
+        """Несколько событий подряд → один flush после debounce (H6)."""
+        from organizer_core import _DebounceScheduler
+
+        flushes: list = []
+        sched = _DebounceScheduler(on_flush=lambda n: flushes.append(n))
+        try:
+            for i in range(5):
+                sched.schedule(f"/tmp/dir/file_{i}.zip")
+            self.assertEqual(sched.pending_count, 5)
+            # Ждём срабатывания debounce (min 1.0 c)
+            deadline = time.time() + 6
+            while not flushes and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(flushes), 1, "Сортировка должна запуститься один раз")
+            self.assertEqual(flushes[0], 5)
+        finally:
+            sched.cancel()
+
+    def test_debounce_scheduler_cancel_prevents_flush(self):
+        """cancel() отменяет отложенный flush — сортировка не запускается (H6)."""
+        from organizer_core import _DebounceScheduler
+
+        flushes: list = []
+        sched = _DebounceScheduler(on_flush=lambda n: flushes.append(n))
+        sched.schedule("/tmp/dir/late.zip")
+        sched.cancel()
+        time.sleep(1.5)
+        self.assertEqual(flushes, [])
+        # Новые события после cancel тоже игнорируются
+        sched.schedule("/tmp/dir/after_cancel.zip")
+        time.sleep(0.2)
+        self.assertEqual(sched.pending_count, 0)
+
+    def test_debounce_scheduler_skips_incomplete_downloads(self):
+        """События по .crdownload/.part не планируют сортировку (H6)."""
+        from organizer_core import _DebounceScheduler
+
+        flushes: list = []
+        sched = _DebounceScheduler(on_flush=lambda n: flushes.append(n))
+        try:
+            sched.schedule("/tmp/dir/big.zip.crdownload")
+            sched.schedule("/tmp/dir/big.zip.part")
+            sched.schedule("/tmp/dir/big.zip")
+            self.assertEqual(sched.pending_count, 1)
+        finally:
+            sched.cancel()
+
+    def test_debounce_respects_stop_flag(self):
+        """Если мониторинг остановлен, новые события не планируются (H6)."""
+        from organizer_core import _DebounceScheduler
+
+        flushes: list = []
+        sched = _DebounceScheduler(
+            on_flush=lambda n: flushes.append(n), is_stopped=lambda: True
+        )
+        sched.schedule("/tmp/dir/file.zip")
+        self.assertEqual(sched.pending_count, 0)
+        time.sleep(0.1)
+        self.assertEqual(flushes, [])
+
+    def test_path_from_event_uses_dest_for_moved(self):
+        """Для события moved берётся dest_path (H6)."""
+
+        class _Evt:
+            def __init__(self, src: str, dest: str = "") -> None:
+                self.src_path = src
+                self.dest_path = dest
+                self.is_directory = False
+
+        from organizer_core import _path_from_event
+
+        self.assertEqual(_path_from_event(_Evt("/a/x.zip")), "/a/x.zip")
+        self.assertEqual(
+            _path_from_event(_Evt("/a/x.crdownload", "/a/x.zip")), "/a/x.zip"
+        )
+
+    def test_incomplete_suffix_detection(self):
+        """Маркеры незавершённой загрузки определяются корректно (H6)."""
+        from organizer_core import _is_incomplete_path
+
+        self.assertTrue(_is_incomplete_path("/a/file.crdownload"))
+        self.assertTrue(_is_incomplete_path("/a/file.PART"))
+        self.assertTrue(_is_incomplete_path("/a/file.download"))
+        self.assertFalse(_is_incomplete_path("/a/file.zip"))
+        self.assertFalse(_is_incomplete_path("/a/partial.zip"))
+
+    def test_file_is_stable_detects_unchanged(self):
+        """_file_is_stable считает неизменяемый файл стабильным (H6)."""
+        from organizer_core import _file_is_stable
+        f = self.test_dir / "stable.bin"
+        f.write_text("data")
+        self.assertTrue(_file_is_stable(str(f), stable_seconds=0.1))
+
+    def test_file_is_stable_detects_growth(self):
+        """_file_is_stable замечает дозапись файла (H6)."""
+        from organizer_core import _file_is_stable
+        f = self.test_dir / "growing.bin"
+        f.write_text("data")
+
+        def grow() -> None:
+            time.sleep(0.05)
+            with open(f, "a", encoding="utf-8") as fh:
+                fh.write("more data")
+
+        t = threading.Thread(target=grow)
+        t.start()
+        self.assertFalse(_file_is_stable(str(f), stable_seconds=0.3))
+        t.join()
+
+    def tearDown(self):
+        stop_monitoring()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestCli(unittest.TestCase):
+    """Тесты CLI (C1): команды README должны работать без GUI/tkinter."""
+
+    CLI = str(Path(__file__).parent / "file_organizer.py")
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "photo.jpg").write_text("jpg")
+        (self.test_dir / "doc.pdf").write_text("pdf")
+
+    def _run(self, *args: str) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(
+            [sys.executable, self.CLI, *args],
+            capture_output=True, text=True, timeout=60,
+        )
+
+    def test_cli_help(self):
+        """--help печатает справку и завершается успешно (C1)."""
+        r = self._run("--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("--dry-run", r.stdout)
+        self.assertIn("--undo-count", r.stdout)
+
+    def test_cli_dry_run_does_not_move(self):
+        """--dry-run показывает план и ничего не перемещает (C1)."""
+        r = self._run(str(self.test_dir), "--dry-run")
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue((self.test_dir / "photo.jpg").exists())
+        self.assertFalse((self.test_dir / "images").exists())
+
+    def test_cli_organize_and_undo_info(self):
+        """Сортировка и --undo-info работают через CLI (C1)."""
+        r = self._run(str(self.test_dir), "-q")
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue((self.test_dir / "images" / "photo.jpg").exists())
+
+        r = self._run(str(self.test_dir), "--undo-info")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("2", r.stdout)
+
+    def test_cli_undo_count(self):
+        """--undo-count отменяет указанное число операций (C1)."""
+        self._run(str(self.test_dir), "-q")
+        r = self._run(str(self.test_dir), "--undo-count", "1", "-q")
+        self.assertEqual(r.returncode, 0)
+        # Один файл вернулся, второй остался в категории
+        restored = (self.test_dir / "photo.jpg").exists() or (self.test_dir / "doc.pdf").exists()
+        self.assertTrue(restored)
+
+    def test_cli_no_recursive(self):
+        """--no-recursive обрабатывает только корень папки (C1)."""
+        sub = self.test_dir / "sub"
+        sub.mkdir()
+        (sub / "nested.jpg").write_text("jpg")
+
+        self._run(str(self.test_dir), "--no-recursive", "-q")
+        self.assertTrue((sub / "nested.jpg").exists())
+
+    def test_cli_config_flag(self):
+        """--config использует указанный файл вместо config.json (C1)."""
+        cfg = self.test_dir / "custom.json"
+        cfg.write_text(json.dumps({
+            "categories": {"music": ["mp3"], "other": []},
+            "settings": {"recursive": True},
+        }), encoding="utf-8")
+        (self.test_dir / "song.mp3").write_text("mp3")
+
+        r = self._run(str(self.test_dir), "--config", str(cfg), "-q")
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue((self.test_dir / "music" / "song.mp3").exists())
+
+    def test_cli_missing_config_reports_error(self):
+        """Несуществующий --config даёт понятную ошибку и код возврата 1 (C1)."""
+        r = self._run(str(self.test_dir), "--config", str(self.test_dir / "nope.json"))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("не найден", r.stderr)
+
+    def test_cli_missing_dir_reports_error(self):
+        """Несуществующая папка даёт ошибку и код возврата 1 (C1)."""
+        r = self._run(str(self.test_dir / "no_such_dir"))
+        self.assertEqual(r.returncode, 1)
+
+    def test_cli_conflicting_operations_rejected(self):
+        """--undo и --monitor вместе отклоняются (C1)."""
+        r = self._run(str(self.test_dir), "--undo", "--monitor")
+        self.assertEqual(r.returncode, 2)
+
+    def test_cli_undo_count_zero_is_safe(self):
+        """--undo-count 0 ничего не отменяет (C2 через CLI)."""
+        self._run(str(self.test_dir), "-q")
+        r = self._run(str(self.test_dir), "--undo-count", "0")
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue((self.test_dir / "images" / "photo.jpg").exists())
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestScriptFilesScope(unittest.TestCase):
+    """Тест M12: служебные имена пропускаются только в корне папки."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def test_script_file_in_root_skipped(self):
+        """organizer_core.py в корне сортируемой папки не трогается (M12)."""
+        (self.test_dir / "organizer_core.py").write_text("# core")
+        (self.test_dir / "config.json").write_text("{}")
+        stats = organize_files(str(self.test_dir), verbose=False)
+        self.assertEqual(stats["moved"], 0)
+        self.assertTrue((self.test_dir / "organizer_core.py").exists())
+
+    def test_user_file_with_script_name_in_subfolder_sorted(self):
+        """Пользовательский config.json в подпапке должен сортироваться (M12)."""
+        sub = self.test_dir / "sub"
+        sub.mkdir()
+        (sub / "config.json").write_text("{}")
+
+        stats = organize_files(str(self.test_dir), verbose=False)
+        self.assertEqual(stats["moved"], 1)
+        self.assertFalse((sub / "config.json").exists())
+        self.assertTrue((self.test_dir / "code" / "config.json").exists())
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestScanErrors(unittest.TestCase):
+    """Тест M8: недоступные подпапки учитываются в статистике."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    @unittest.skipIf(os.name == "nt", "нужны права non-root")
+    def test_unreadable_subdir_counted(self):
+        """Недоступная подпапка попадает в errors, а не исчезает молча (M8)."""
+        if getattr(os, "geteuid", lambda: 1)() == 0:
+            self.skipTest("тест не работает под root")
+        locked = self.test_dir / "locked"
+        locked.mkdir()
+        (locked / "hidden.jpg").write_text("jpg")
+        os.chmod(locked, 0o000)
+        try:
+            stats = organize_files(str(self.test_dir), verbose=False)
+            self.assertGreaterEqual(stats["errors"], 1)
+        finally:
+            os.chmod(locked, 0o755)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestLogPathMasking(unittest.TestCase):
+    """Тест M11: полный путь не попадает в лог."""
+
+    def test_dir_masked_for_log(self):
+        """Директория в логе маскируется (~/... или имя) (M11)."""
+        from organizer_core import _mask_dir_for_log
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            masked = _mask_dir_for_log(root)
+            # Полный путь в лог не попадает: вне домашней папки — только имя
+            self.assertNotEqual(masked, str(root))
+            self.assertEqual(masked, root.name)
+
+    def test_file_path_masked_relative(self):
+        """Путь файла в логе — относительный внутри рабочей папки (M11)."""
+        from organizer_core import _mask_path_for_log
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            masked = _mask_path_for_log(root / "sub" / "file.txt", root)
+            self.assertEqual(masked, "sub/file.txt")
+
+
 def run_tests():
     """Запуск тестов без pytest."""
     loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-
-    # Добавляем все тесты
-    suite.addTests(loader.loadTestsFromTestCase(TestExtMap))
-    suite.addTests(loader.loadTestsFromTestCase(TestPathSafety))
-    suite.addTests(loader.loadTestsFromTestCase(TestUniquePath))
-    suite.addTests(loader.loadTestsFromTestCase(TestOrganizeFiles))
-    suite.addTests(loader.loadTestsFromTestCase(TestUndoOperation))
-    suite.addTests(loader.loadTestsFromTestCase(TestConfigLoading))
-    suite.addTests(loader.loadTestsFromTestCase(TestDuplicateStrategies))
-    suite.addTests(loader.loadTestsFromTestCase(TestProtectedDir))
-    suite.addTests(loader.loadTestsFromTestCase(TestUndoLogFormat))
-    suite.addTests(loader.loadTestsFromTestCase(TestCaseInsensitiveDedup))
-    suite.addTests(loader.loadTestsFromTestCase(TestConcurrentOrganize))
+    suite = loader.loadTestsFromModule(sys.modules[__name__])
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
