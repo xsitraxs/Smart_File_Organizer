@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1137,6 +1138,15 @@ class TestPortableJournalPaths(unittest.TestCase):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
 
+def _read_entries(path: Path) -> list:
+    """Читает записи JSONL-журнала (для проверок в тестах)."""
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 class TestContentDuplicates(unittest.TestCase):
     """Тесты поиска дубликатов по содержимому (settings.content_duplicates).
 
@@ -1387,6 +1397,512 @@ class TestContentDuplicatesCli(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestSuiteIsLocaleIndependent(unittest.TestCase):
+    """
+    Текстовые файлы в тестах пишем/читаем с явной кодировкой.
+
+    Без неё используется локальная кодировка: на Windows это cp1252, где нет
+    кириллицы, и тест падает с UnicodeEncodeError (ровно это поймал CI на
+    Windows-раннере). Проверяем статически, чтобы ошибка была видна на любой
+    платформе, а не только на Windows.
+    """
+
+    def test_non_ascii_text_calls_have_explicit_encoding(self):
+        import ast
+
+        src = Path(__file__).read_text(encoding="utf-8")
+        offenders = []
+        for node in ast.walk(ast.parse(src)):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr not in ("write_text", "read_text"):
+                continue
+            if any(kw.arg == "encoding" for kw in node.keywords):
+                continue
+            literal = ast.get_source_segment(src, node.args[0]) if node.args else ""
+            if literal and any(ord(ch) > 127 for ch in literal):
+                offenders.append(f"строка {node.lineno}: {literal[:40]!r}")
+        self.assertEqual(offenders, [], "текст без явной кодировки: " + "; ".join(offenders))
+
+
+class TestJournalCompaction(unittest.TestCase):
+    """Тесты ограничения журнала отмены (settings.max_undo_entries)."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def _write_many(self, count: int) -> None:
+        for i in range(count):
+            (self.test_dir / f"f{i:02d}.jpg").write_text(f"data{i}")
+
+    def _organize(self, limit: int) -> dict:
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["max_undo_entries"] = limit
+        return organize_files(str(self.test_dir), verbose=False, config=cfg)
+
+    def _journal_lines(self) -> int:
+        path = self.test_dir / UNDO_LOG_FILENAME
+        if not path.exists():
+            return 0
+        return len([line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()])
+
+    def test_journal_is_capped(self):
+        """Журнал не превышает лимит записей."""
+        self._write_many(12)
+
+        stats = self._organize(limit=5)
+
+        self.assertEqual(stats["moved"], 12)
+        self.assertLessEqual(self._journal_lines(), 5)
+        self.assertGreater(stats["journal_trimmed"], 0)
+
+    def test_newest_entries_survive(self):
+        """Остаются самые свежие записи: отменяется последняя пятёрка."""
+        self._write_many(12)
+
+        self._organize(limit=5)
+        restored = undo_last_operation(str(self.test_dir), verbose=False)
+
+        self.assertEqual(restored["restored"], 5)
+        self.assertEqual(restored["errors"], 0)
+        # В корне оказались ровно те файлы, чьи записи остались в журнале
+        in_root = sorted(
+            p.name for p in self.test_dir.iterdir()
+            if p.is_file() and p.name != UNDO_LOG_FILENAME
+        )
+        # Порядок обработки — сортировка по пути, поэтому в журнале остались
+        # записи про пять последних по имени файлов (f07…f11)
+        self.assertEqual(
+            in_root, ["f07.jpg", "f08.jpg", "f09.jpg", "f10.jpg", "f11.jpg"]
+        )
+
+    def test_zero_means_no_limit(self):
+        """0 = журнал без ограничения (поведение по умолчанию до этого фикса)."""
+        self._write_many(12)
+
+        stats = self._organize(limit=0)
+
+        self.assertEqual(self._journal_lines(), 12)
+        self.assertEqual(stats["journal_trimmed"], 0)
+
+    def test_existing_oversized_journal_is_trimmed(self):
+        """Разросшийся журнал подрезается при следующей сортировке."""
+        old_stamp = datetime.now().isoformat()
+        entries = [
+            {
+                "timestamp": old_stamp, "action": "move",
+                "source": f"old_{i}.jpg", "destination": f"images/old_{i}.jpg",
+            }
+            for i in range(50)
+        ]
+        (self.test_dir / UNDO_LOG_FILENAME).write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries),
+            encoding="utf-8",
+        )
+        (self.test_dir / "new.jpg").write_text("new")
+
+        self._organize(limit=10)
+
+        self.assertLessEqual(self._journal_lines(), 10)
+        # последняя по времени запись — про только что перемещённый файл
+        last = json.loads(
+            [line for line in (self.test_dir / UNDO_LOG_FILENAME).read_text(encoding="utf-8").splitlines() if line.strip()][-1]
+        )
+        self.assertEqual(last["source"], "new.jpg")
+
+    def test_invalid_value_is_rejected(self):
+        """Нечисловое значение отклоняется валидацией конфига до сортировки."""
+        self._write_many(3)
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["max_undo_entries"] = "много"
+
+        with self.assertRaises(ValueError):
+            organize_files(str(self.test_dir), verbose=False, config=cfg)
+
+        # Файлы не тронуты
+        self.assertEqual(len(list(self.test_dir.glob("*.jpg"))), 3)
+
+    def test_schema_rejects_negative(self):
+        """Отрицательный лимит отклоняется валидацией конфига."""
+        from organizer_core import _validate_config_schema
+
+        cfg = {"categories": {"images": ["jpg"]}, "settings": {"max_undo_entries": -1}}
+        self.assertFalse(_validate_config_schema(cfg))
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestJournalDurability(unittest.TestCase):
+    """Тесты записи журнала: постоянный дескриптор, fsync, чтение обрывков."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def test_append_flushes_to_disk_without_close(self):
+        """Записи видны на диске до close() — журнал переживает падение процесса."""
+        from organizer_core import _UndoLogWriter
+
+        path = self.test_dir / UNDO_LOG_FILENAME
+        writer = _UndoLogWriter(path)
+        try:
+            writer.append({"action": "move", "source": "a", "destination": "b"})
+            # Читаем другим дескриптором, не закрывая писателя
+            content = path.read_text(encoding="utf-8")
+        finally:
+            writer.close()
+        self.assertIn('"action": "move"', content)
+
+    def test_partial_line_is_skipped_on_read(self):
+        """Оборванная строка (Ctrl+C) не ломает чтение остальных записей."""
+        from organizer_core import _load_undo_log
+
+        path = self.test_dir / UNDO_LOG_FILENAME
+        path.write_text(
+            json.dumps({"action": "move", "source": "a", "destination": "b"}) + "\n"
+            + '{"action": "move", "source": "broken' + "\n"
+            + json.dumps({"action": "move", "source": "c", "destination": "d"}) + "\n",
+            encoding="utf-8",
+        )
+        entries = _load_undo_log(self.test_dir)
+        self.assertEqual([e["source"] for e in entries], ["a", "c"])
+
+    def test_fsync_batches_do_not_block_writes(self):
+        """Пачка fsync не должна останавливать запись (ловил дедлок на 50-й записи)."""
+        from organizer_core import JOURNAL_FSYNC_INTERVAL, _UndoLogWriter
+
+        path = self.test_dir / UNDO_LOG_FILENAME
+        writer = _UndoLogWriter(path)
+        total = JOURNAL_FSYNC_INTERVAL * 3 + 1
+        finished = threading.Event()
+
+        def produce() -> None:
+            for i in range(total):
+                writer.append({"action": "move", "source": f"f{i}"})
+            finished.set()
+
+        thread = threading.Thread(target=produce, daemon=True)
+        thread.start()
+        self.assertTrue(
+            finished.wait(timeout=30),
+            "запись встала: похоже на дедлок лока вокруг fsync",
+        )
+        writer.close()
+        self.assertEqual(len(_read_entries(path)), total)
+
+    def test_fsync_happens_every_interval(self):
+        """fsync вызывается пачками — записи переживают потерю питания."""
+        from unittest import mock
+
+        import organizer_core as oc
+
+        writer = oc._UndoLogWriter(self.test_dir / UNDO_LOG_FILENAME)
+        # Патч os.fsync действует на процесс целиком, но тест однопоточный.
+        with mock.patch.object(oc.os, "fsync", wraps=os.fsync) as spy:
+            for i in range(oc.JOURNAL_FSYNC_INTERVAL + 1):
+                writer.append({"action": "move", "source": f"f{i}"})
+        writer.close()
+
+        self.assertGreaterEqual(spy.call_count, 1)
+
+    def test_close_is_idempotent(self):
+        """Повторный close() безопасен (вызывается и в конце, и в finally)."""
+        from organizer_core import _UndoLogWriter
+
+        writer = _UndoLogWriter(self.test_dir / UNDO_LOG_FILENAME)
+        writer.append({"action": "move"})
+        writer.close()
+        writer.close()  # не должно бросать
+
+    def test_append_after_close_reopens(self):
+        """После close() писатель снова открывает файл (мониторинг вызывает organize повторно)."""
+        from organizer_core import _UndoLogWriter
+
+        path = self.test_dir / UNDO_LOG_FILENAME
+        writer = _UndoLogWriter(path)
+        writer.append({"action": "move", "source": "a"})
+        writer.close()
+        writer.append({"action": "move", "source": "b"})
+        writer.close()
+        self.assertEqual(len(_read_entries(path)), 2)
+
+    def test_writes_survive_reopen(self):
+        """Данные не теряются между открытиями (на Windows это особенно важно)."""
+        from organizer_core import _UndoLogWriter
+
+        path = self.test_dir / UNDO_LOG_FILENAME
+        for i in range(3):
+            writer = _UndoLogWriter(path)
+            writer.append({"action": "move", "source": f"f{i}"})
+            writer.close()
+        self.assertEqual([e["source"] for e in _read_entries(path)], ["f0", "f1", "f2"])
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestBackupCleanup(unittest.TestCase):
+    """Тесты очистки старых бэкапов заменённых файлов."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "images").mkdir()
+
+    @staticmethod
+    def _stamp(days_ago: int) -> str:
+        return (datetime.now() - timedelta(days=days_ago)).strftime("%Y%m%d_%H%M%S")
+
+    def _backup(self, name: str, days_ago: int) -> Path:
+        path = self.test_dir / "images" / f"{name}.bak-{self._stamp(days_ago)}"
+        path.write_text("backup")
+        return path
+
+    def _organize(self, days: int, dry_run: bool = False) -> dict:
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["backup_retention_days"] = days
+        return organize_files(str(self.test_dir), dry_run=dry_run, verbose=False, config=cfg)
+
+    def test_old_backup_removed_fresh_kept(self):
+        """Старый бэкап удаляется, свежий остаётся."""
+        old = self._backup("photo.jpg", 10)
+        fresh = self._backup("doc.pdf", 1)
+
+        stats = self._organize(days=7)
+
+        self.assertEqual(stats["backups_removed"], 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_disabled_by_default_keeps_backups(self):
+        """По умолчанию (0) бэкапы не удаляются — их век."""
+        old = self._backup("photo.jpg", 365)
+
+        stats = self._organize(days=0)
+
+        self.assertEqual(stats["backups_removed"], 0)
+        self.assertTrue(old.exists())
+
+    def test_dry_run_only_reports(self):
+        """В dry-run бэкапы не удаляются, но видно, сколько было бы удалено."""
+        old = self._backup("photo.jpg", 30)
+
+        stats = self._organize(days=1, dry_run=True)
+
+        self.assertEqual(stats["backups_removed"], 1)
+        self.assertTrue(old.exists(), "dry-run удалил файл")
+
+    def test_similar_names_are_never_touched(self):
+        """Файлы, лишь похожие на бэкапы, не удаляются.
+
+        Проверяем саму уборку (без сортировки), иначе похожие файлы просто
+        уехали бы в другую категорию и тест проверял бы не то.
+        """
+        from organizer_core import _cleanup_old_backups
+
+        weird = [
+            self.test_dir / "images" / "photo.jpg.bak-недата",  # имя, не содержимое
+            self.test_dir / "images" / "photo.jpg.bak",
+            self.test_dir / "images" / "backup.jpg",
+            self.test_dir / "images" / "photo.jpg.bak-00000000_000000",
+            self.test_dir / "images" / "photo.jpg.bak-20260101_1200",
+        ]
+        for path in weird:
+            # Явная кодировка обязательна: на Windows (cp1252) write_text без неё
+            # падает на кириллице — тест проверял бы не уборку, а локаль.
+            path.write_text("not a backup", encoding="utf-8")
+
+        removed = _cleanup_old_backups(self.test_dir, {"images"}, 1, False, lambda msg: None)
+
+        self.assertEqual(removed, 0)
+        for path in weird:
+            self.assertTrue(path.exists(), f"удалён чужой файл {path.name}")
+
+    def test_backups_are_not_resorted(self):
+        """Бэкап остаётся рядом с заменённым файлом, а не уезжает в other/."""
+        backup = self._backup("photo.jpg", 0)
+        (self.test_dir / "a.jpg").write_text("new")
+
+        self._organize(days=0)
+
+        self.assertTrue(backup.exists(), "бэкап пересортирован")
+        self.assertFalse((self.test_dir / "other" / backup.name).exists())
+
+    def test_deleted_backup_drops_journal_entry(self):
+        """Записи журнала про удалённый бэкап убираются: undo не зовёт в пустоту."""
+        old = self._backup("photo.jpg", 30)
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "action": "backup",
+            "source": f"images/{old.name}",
+            "destination": "images/photo.jpg",
+            "original_name": "photo.jpg",
+        }
+        (self.test_dir / UNDO_LOG_FILENAME).write_text(
+            json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+        self._organize(days=7)
+
+        self.assertNotIn('"action": "backup"', (self.test_dir / UNDO_LOG_FILENAME).read_text(encoding="utf-8"))
+        self.assertFalse(old.exists())
+
+    def test_kept_backup_entry_survives(self):
+        """Если бэкап остался, запись журнала про него сохраняется."""
+        keep = self._backup("photo.jpg", 1)
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "action": "backup",
+            "source": f"images/{keep.name}",
+            "destination": "images/photo.jpg",
+            "original_name": "photo.jpg",
+        }
+        (self.test_dir / UNDO_LOG_FILENAME).write_text(
+            json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+        self._organize(days=7)
+
+        self.assertIn('"action": "backup"', (self.test_dir / UNDO_LOG_FILENAME).read_text(encoding="utf-8"))
+
+    def test_cleanup_runs_even_when_nothing_to_sort(self):
+        """Уборка работает и когда сортировать нечего (иначе она бы не запускалась)."""
+        old = self._backup("photo.jpg", 30)
+
+        stats = self._organize(days=7)
+
+        self.assertEqual(stats["moved"], 0)
+        self.assertEqual(stats["backups_removed"], 1)
+        self.assertFalse(old.exists())
+
+    def test_schema_rejects_negative_days(self):
+        """Отрицательный срок хранения отклоняется валидацией конфига."""
+        from organizer_core import _validate_config_schema
+
+        cfg = {"categories": {"images": ["jpg"]}, "settings": {"backup_retention_days": -5}}
+        self.assertFalse(_validate_config_schema(cfg))
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestBackupCleanupCli(unittest.TestCase):
+    """Флаг --backup-retention-days у CLI."""
+
+    CLI = str(Path(__file__).parent / "file_organizer.py")
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "images").mkdir()
+        stamp = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d_%H%M%S")
+        self.backup = self.test_dir / "images" / f"photo.jpg.bak-{stamp}"
+        self.backup.write_text("backup")
+
+    def _run(self, *args: str) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(
+            [sys.executable, self.CLI, *args],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace",
+        )
+
+    def test_flag_removes_old_backup(self):
+        """С флагом старый бэкап удаляется, счётчик попадает в вывод."""
+        r = self._run(str(self.test_dir), "--backup-retention-days", "7")
+
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(self.backup.exists())
+        self.assertIn("Удалено старых бэкапов: 1", r.stdout)
+
+    def test_without_flag_backup_stays(self):
+        """Без флага бэкап не трогается."""
+        r = self._run(str(self.test_dir))
+
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(self.backup.exists())
+
+    def test_dry_run_says_it_will_delete_and_keeps_file(self):
+        """В --dry-run итог говорит о плане, а бэкап остаётся на месте."""
+        r = self._run(str(self.test_dir), "--dry-run", "--backup-retention-days", "7")
+
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Будет удалено старых бэкапов: 1", r.stdout)
+        self.assertTrue(self.backup.exists())
+
+    def test_help_mentions_flag(self):
+        """Флаг описан в --help."""
+        r = self._run("--help")
+        self.assertIn("--backup-retention-days", r.stdout)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestDirLocks(unittest.TestCase):
+    """Тесты реестра локов каталогов (утечка записей)."""
+
+    def test_locks_are_released_after_organize(self):
+        """После сортировки в реестре не остаётся записей."""
+        import organizer_core as oc
+
+        for i in range(20):
+            sub = Path(tempfile.mkdtemp()) / f"d{i}"
+            sub.mkdir()
+            (sub / "a.txt").write_text("x")
+            organize_files(str(sub), verbose=False)
+
+        self.assertEqual(len(oc._dir_locks), 0)
+
+    def test_same_dir_is_not_sorted_twice_in_parallel(self):
+        """Защита от параллельной сортировки одной папки сохраняется.
+
+        Тест детерминированный: потоки стартуют одновременно (Barrier), а
+        перемещение искусственно замедлено — иначе на быстрой машине первый
+        поток успевал бы закончить, и «конкурентов» просто не оставалось
+        (flake на медленном раннере: ровно этот сценарий ловил CI).
+        """
+        from unittest import mock
+
+        import organizer_core as oc
+
+        results: list = []
+        test_dir = Path(tempfile.mkdtemp())
+        (test_dir / "a.txt").write_text("x", encoding="utf-8")
+        barrier = threading.Barrier(4)
+        real_move = shutil.move
+
+        def slow_move(*args: Any, **kwargs: Any) -> Any:
+            time.sleep(0.5)  # лок держится заведомо дольше, чем стартуют потоки
+            return real_move(*args, **kwargs)
+
+        def worker() -> None:
+            barrier.wait(timeout=30)
+            results.append(organize_files(str(test_dir), verbose=False))
+
+        with mock.patch.object(oc.shutil, "move", side_effect=slow_move):
+            threads = [threading.Thread(target=worker) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+
+        self.assertEqual(len(results), 4)
+        self.assertEqual(sum(1 for r in results if r.get("skipped_concurrent")), 3)
+
+    def test_lock_entry_removed_only_when_nobody_waits(self):
+        """Запись удаляется последним пользователем, а не первым."""
+        import organizer_core as oc
+
+        key = str(Path(tempfile.mkdtemp()))
+        entry = oc._get_dir_lock(key)
+        second = oc._get_dir_lock(key)
+        self.assertIs(entry, second)
+
+        oc._release_dir_lock(key, entry)
+        self.assertIn(key, oc._dir_locks, "запись удалена при живом пользователе")
+
+        oc._release_dir_lock(key, second)
+        self.assertNotIn(key, oc._dir_locks)
 
 
 class TestConcurrentOrganize(unittest.TestCase):

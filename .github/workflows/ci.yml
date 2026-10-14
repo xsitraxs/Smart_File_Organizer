@@ -119,5 +119,33 @@ jobs:
 
       - name: Run coverage
         run: |
-          coverage run --source=organizer_core -m unittest test_organizer_core
+          set -o pipefail
+          coverage run --source=organizer_core -m unittest test_organizer_core 2>&1 \
+            | tee "${RUNNER_TEMP}/coverage-tests.log"
           coverage report -m
+
+      # Под coverage тесты идут медленнее, поэтому падать тут может то, что
+      # проходит в job'е test. Причину выносим в аннотации — иначе её пришлось
+      # бы искать глазами в логе чужого прогона (как это было с flake'ом в
+      # параллельном тесте).
+      - name: Итог тестов под coverage в аннотациях
+        if: always()
+        shell: bash
+        run: |
+          set +e +o pipefail
+          emit() {
+            while IFS= read -r line; do
+              echo "::error title=Coverage failure::${line}"
+            done
+          }
+          notice() {
+            while IFS= read -r line; do
+              echo "::notice title=Coverage::${line}"
+            done
+          }
+          log="${RUNNER_TEMP}/coverage-tests.log"
+          [ -f "$log" ] || exit 0
+          { grep -hE "^(FAIL|ERROR): |^FAILED " "$log" || true; } | sort -u | head -10 | emit
+          { grep -hE "AssertionError|Error: |Traceback" "$log" || true; } | sort -u | head -5 | emit
+          { grep -hE "^(Ran [0-9]+ tests|OK|FAILED)" "$log" || true; } | sort -u | head -3 | notice
+          exit 0
