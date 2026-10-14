@@ -57,7 +57,10 @@ jobs:
       - name: Итог тестов в аннотациях
         if: always()
         shell: bash
+        # GitHub запускает bash с -e -o pipefail: grep без совпадений вернул бы
+        # единицу и уронил бы шаг, поэтому глушим строгий режим.
         run: |
+          set +e +o pipefail
           emit() {
             while IFS= read -r line; do
               echo "::error title=CI failure::${line}"
@@ -71,9 +74,10 @@ jobs:
           for log in "${RUNNER_TEMP}/unittest.log" "${RUNNER_TEMP}/pytest.log"; do
             [ -f "$log" ] || continue
             echo "--- ${log} ---"
-            grep -hE "^(FAIL|ERROR): |^FAILED " "$log" | sort -u | head -10 | emit
-            grep -hE "AssertionError|Error: " "$log" | sort -u | head -5 | emit
-            grep -hE "^(Ran [0-9]+ tests|OK|FAILED|[0-9]+ (passed|failed))" "$log" | sort -u | head -3 | notice
+            { grep -hE "^(FAIL|ERROR): |^FAILED " "$log" || true; } | sort -u | head -10 | emit
+            { grep -hE "AssertionError|Error: " "$log" || true; } | sort -u | head -5 | emit
+            { grep -hE "^(Ran [0-9]+ tests|OK|FAILED|[0-9]+ (passed|failed))" "$log" || true; } \
+              | sort -u | head -3 | notice
           done
           exit 0
 
