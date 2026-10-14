@@ -2,6 +2,7 @@
 
 import contextlib
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -193,6 +194,13 @@ PROTECTED_ABS_PATHS: list[Path] = [Path(p) for p in _PROTECTED_EXACT_PATHS]
 MAX_UNIQUE_PATH_ATTEMPTS = 1000  # Защита от DoS
 MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1 GB лимит размера файла
 
+# Дубликаты по содержимому (опция settings.content_duplicates).
+# Сравнивать файлы целиком дорого, поэтому сначала сверяем размер и хэш первых
+# PARTIAL_HASH_BYTES байт, а полный SHA-256 считаем только при совпадении
+# префикса (коллизия первых 64 КБ возможна, но редка).
+PARTIAL_HASH_BYTES = 64 * 1024
+HASH_CHUNK_BYTES = 1024 * 1024
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "categories": {
         "images":     ["jpg", "jpeg", "png", "gif", "bmp", "svg", "webp", "ico", "tiff", "raw", "heic", "heif"],
@@ -218,6 +226,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "use_watchdog":       True,
         "script_files":       list(DEFAULT_SCRIPT_FILES),  # Настраиваемые имена
         "max_file_size":      MAX_FILE_SIZE,  # Лимит размера файла
+        "content_duplicates": False,  # Не переносить файлы с уже имеющимся содержимым
     },
 }
 
@@ -323,6 +332,7 @@ def _validate_config_schema(config: Any) -> bool:
         ("ignore_hidden",      bool),
         ("duplicate_strategy", str),
         ("use_watchdog",       bool),
+        ("content_duplicates", bool),
     ]
     for key, expected_type in type_checks:
         if key in s and not isinstance(s[key], expected_type):
@@ -829,6 +839,120 @@ def _scan_files_fast(root: Path, recursive: bool) -> tuple[list[tuple[Path, os.s
     return result, scan_errors
 
 
+# ── Дубликаты по содержимому ───────────────────────────────────────────────────
+
+def _hash_prefix(path: Path, size: int, limit: int = PARTIAL_HASH_BYTES) -> Optional[str]:
+    """SHA-256 первых `limit` байт файла (или всего файла, если он короче)."""
+    hasher = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            remaining = min(size, limit)
+            while remaining > 0:
+                chunk = fh.read(min(HASH_CHUNK_BYTES, remaining))
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                remaining -= len(chunk)
+    except OSError:
+        return None
+    return hasher.hexdigest()
+
+
+def _hash_full(path: Path) -> Optional[str]:
+    """SHA-256 всего файла — вызывается только при совпадении размера и префикса."""
+    hasher = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(HASH_CHUNK_BYTES), b""):
+                hasher.update(chunk)
+    except OSError:
+        return None
+    return hasher.hexdigest()
+
+
+class _ContentIndex:
+    """
+    Индекс содержимого файлов каталога: (размер, хэш префикса) → файлы.
+
+    Индексация ленивая: файлы каталога читаются только при первой проверке
+    (первый файл, который вообще понадобилось сравнить). Полный SHA-256
+    считается тоже лениво — для кандидатов, совпавших по размеру и префиксу.
+    Файлы, перемещённые в течение текущего прогона, добавляются в индекс, поэтому
+    дубликат ловится и внутри одной партии, а не только среди старых файлов.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self._dir = directory
+        self._by_prefix: dict[tuple[int, str], list[Path]] = {}
+        self._full: dict[Path, Optional[str]] = {}
+        self._built = False
+        self._unavailable = False
+
+    def _build(self) -> None:
+        self._built = True
+        try:
+            with os.scandir(self._dir) as it:
+                entries = [
+                    (Path(e.path), e.stat().st_size)
+                    for e in it
+                    if e.is_file(follow_symlinks=True)
+                ]
+        except OSError:
+            self._unavailable = True
+            return
+        for path, size in entries:
+            self._index(path, size)
+
+    def _index(self, path: Path, size: int) -> None:
+        prefix = _hash_prefix(path, size)
+        if prefix is not None:
+            self._by_prefix.setdefault((size, prefix), []).append(path)
+
+    def add(self, path: Path) -> None:
+        """Регистрирует файл (после перемещения) для последующих сравнений."""
+        if not self._built:
+            self._build()
+        if self._unavailable:
+            return
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        self._index(path, size)
+
+    def find_identical(self, path: Path, size: int) -> Optional[Path]:
+        """Возвращает известный файл с тем же содержимым, иначе None."""
+        if not self._built:
+            self._build()
+        if self._unavailable:
+            return None
+        prefix = _hash_prefix(path, size)
+        if prefix is None:
+            return None
+        candidates = self._by_prefix.get((size, prefix))
+        if not candidates:
+            return None
+        digest = _hash_full(path)
+        if digest is None:
+            return None
+        for candidate in candidates:
+            if candidate == path:
+                continue
+            try:
+                if candidate.samefile(path):
+                    continue
+            except OSError:
+                pass
+            if self._full_digest(candidate) == digest:
+                return candidate
+        return None
+
+    def _full_digest(self, path: Path) -> Optional[str]:
+        if path not in self._full:
+            self._full[path] = _hash_full(path)
+        return self._full[path]
+
+
 # ── Запись лога отмены ────────────────────────────────────────────────────────
 
 class _UndoLogWriter:
@@ -982,7 +1106,7 @@ def organize_files(
         )
         return {
             "moved": 0, "skipped": 0, "errors": 0,
-            "duplicates": 0, "empty_dirs_removed": 0,
+            "duplicates": 0, "content_duplicates": 0, "empty_dirs_removed": 0,
             "by_category": {}, "skipped_concurrent": True,
         }
 
@@ -1026,6 +1150,8 @@ def _organize_files_impl(
     use_dry_run: bool = settings.get("dry_run", False) or dry_run
     clean_empty: bool = settings.get("clean_empty_dirs", True)
     dup_strategy: str = settings.get("duplicate_strategy", "rename")  # rename | skip | replace
+    # Дубликаты по содержимому — опция: чтение файлов стоит времени, по умолчанию выключено
+    detect_content_dups: bool = bool(settings.get("content_duplicates", False))
 
     source_path = Path(source_dir).resolve()
     if not source_path.exists():
@@ -1039,7 +1165,7 @@ def _organize_files_impl(
 
     stats: dict[str, Any] = {
         "moved": 0, "skipped": 0, "errors": 0,
-        "duplicates": 0, "empty_dirs_removed": 0,
+        "duplicates": 0, "content_duplicates": 0, "empty_dirs_removed": 0,
         "by_category": {},
     }
     session_log: list[dict] = []
@@ -1057,6 +1183,8 @@ def _organize_files_impl(
     log(f"  Режим      : {'рекурсивный' if use_recursive else 'только корень'}")
     if use_dry_run:
         log("  ⚠  DRY-RUN — файлы НЕ будут перемещены")
+    if detect_content_dups:
+        log("  ♻  Дубликаты по содержимому: файлы с уже имеющимся содержимым не переносятся")
     log(f"{'─'*60}\n")
 
     # lru_cache для _resolve_cached инвалидируем ПЕРЕД сканированием,
@@ -1164,6 +1292,12 @@ def _organize_files_impl(
         target_cat_dir = source_path / category
         stats["by_category"].setdefault(category, 0)
 
+        # os.scandir отдаёт файлы в порядке файловой системы, а от порядка зависит
+        # результат: какой из одинаковых файлов останется на месте (дубликаты по
+        # содержимому) и кто получит суффикс _1 при коллизии имён. Сортируем,
+        # чтобы поведение было предсказуемым и одинаковым между запусками.
+        batch.sort(key=lambda item: str(item[0]))
+
         if use_dry_run:
             for file_path, _ in batch:
                 masked = _mask_path_for_log(file_path, source_path)
@@ -1206,9 +1340,30 @@ def _organize_files_impl(
             existing_keys: set[str] = {
                 _name_key(n, case_insensitive) for n in existing_names
             }
+            # Индекс содержимого строится лениво — только если опция включена
+            # и есть с чем сравнивать (первый же файл запускает индексацию).
+            content_index: Optional[_ContentIndex] = (
+                _ContentIndex(target_cat_dir) if detect_content_dups else None
+            )
 
-            for file_path, _ in batch:
+            for file_path, file_stat in batch:
                 target_path = target_cat_dir / file_path.name
+
+                # Дубликаты по содержимому: если точно такой же файл (по SHA-256)
+                # уже лежит в категории, не тащим второй экземпляр. Проверяем до
+                # коллизии имён: одинаковое содержимое важнее одинакового имени.
+                if content_index is not None:
+                    twin = content_index.find_identical(file_path, file_stat.st_size)
+                    if twin is not None:
+                        stats["content_duplicates"] += 1
+                        stats["skipped"] += 1
+                        log(
+                            f"  ♻  Пропущен (то же содержимое, что у "
+                            f"{_mask_path_for_log(twin, source_path)}): "
+                            f"{_mask_path_for_log(file_path, source_path)}"
+                        )
+                        _report_move_progress()
+                        continue
 
                 try:
                     if _name_in_set(
@@ -1310,6 +1465,10 @@ def _organize_files_impl(
                         existing_keys,
                         case_insensitive,
                     )
+                    if content_index is not None:
+                        # Дубликаты внутри одной партии: второй одинаковый файл
+                        # должен найти первый, уже перемещённый.
+                        content_index.add(target_path)
 
                     masked = _mask_path_for_log(file_path, source_path)
                     log(f"  ✓  {masked}  ➜  {category}/{target_path.name}")
@@ -1391,6 +1550,8 @@ def _organize_files_impl(
     log(f"  Перемещено  : {stats['moved']}")
     log(f"  Пропущено   : {stats['skipped']}")
     log(f"  Дубликаты   : {stats['duplicates']}")
+    if detect_content_dups or stats["content_duplicates"]:
+        log(f"  ♻ По содержимому: {stats['content_duplicates']}")
     log(f"  Ошибки      : {stats['errors']}")
     if use_recursive and not use_dry_run:
         log(f"  Пустых папок удалено: {stats['empty_dirs_removed']}")
