@@ -1569,6 +1569,44 @@ class TestJournalDurability(unittest.TestCase):
         entries = _load_undo_log(self.test_dir)
         self.assertEqual([e["source"] for e in entries], ["a", "c"])
 
+    def test_fsync_batches_do_not_block_writes(self):
+        """Пачка fsync не должна останавливать запись (ловил дедлок на 50-й записи)."""
+        from organizer_core import JOURNAL_FSYNC_INTERVAL, _UndoLogWriter
+
+        path = self.test_dir / UNDO_LOG_FILENAME
+        writer = _UndoLogWriter(path)
+        total = JOURNAL_FSYNC_INTERVAL * 3 + 1
+        finished = threading.Event()
+
+        def produce() -> None:
+            for i in range(total):
+                writer.append({"action": "move", "source": f"f{i}"})
+            finished.set()
+
+        thread = threading.Thread(target=produce, daemon=True)
+        thread.start()
+        self.assertTrue(
+            finished.wait(timeout=30),
+            "запись встала: похоже на дедлок лока вокруг fsync",
+        )
+        writer.close()
+        self.assertEqual(len(_read_entries(path)), total)
+
+    def test_fsync_happens_every_interval(self):
+        """fsync вызывается пачками — записи переживают потерю питания."""
+        from unittest import mock
+
+        import organizer_core as oc
+
+        writer = oc._UndoLogWriter(self.test_dir / UNDO_LOG_FILENAME)
+        # Патч os.fsync действует на процесс целиком, но тест однопоточный.
+        with mock.patch.object(oc.os, "fsync", wraps=os.fsync) as spy:
+            for i in range(oc.JOURNAL_FSYNC_INTERVAL + 1):
+                writer.append({"action": "move", "source": f"f{i}"})
+        writer.close()
+
+        self.assertGreaterEqual(spy.call_count, 1)
+
     def test_close_is_idempotent(self):
         """Повторный close() безопасен (вызывается и в конце, и в finally)."""
         from organizer_core import _UndoLogWriter
@@ -1647,12 +1685,12 @@ class TestBackupCleanup(unittest.TestCase):
         self.assertTrue(old.exists())
 
     def test_dry_run_only_reports(self):
-        """В dry-run бэкапы не удаляются."""
+        """В dry-run бэкапы не удаляются, но видно, сколько было бы удалено."""
         old = self._backup("photo.jpg", 30)
 
         stats = self._organize(days=1, dry_run=True)
 
-        self.assertEqual(stats["backups_removed"], 0)
+        self.assertEqual(stats["backups_removed"], 1)
         self.assertTrue(old.exists(), "dry-run удалил файл")
 
     def test_similar_names_are_never_touched(self):
@@ -1781,6 +1819,14 @@ class TestBackupCleanupCli(unittest.TestCase):
         r = self._run(str(self.test_dir))
 
         self.assertEqual(r.returncode, 0)
+        self.assertTrue(self.backup.exists())
+
+    def test_dry_run_says_it_will_delete_and_keeps_file(self):
+        """В --dry-run итог говорит о плане, а бэкап остаётся на месте."""
+        r = self._run(str(self.test_dir), "--dry-run", "--backup-retention-days", "7")
+
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Будет удалено старых бэкапов: 1", r.stdout)
         self.assertTrue(self.backup.exists())
 
     def test_help_mentions_flag(self):

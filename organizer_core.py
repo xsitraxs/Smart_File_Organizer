@@ -1101,19 +1101,29 @@ class _UndoLogWriter:
             self._appends += 1
             self._since_fsync += 1
             if self._since_fsync >= JOURNAL_FSYNC_INTERVAL:
-                self.flush_to_disk()
+                self._fsync_locked()
             self._maybe_compact()
+
+    def _fsync_locked(self) -> None:
+        """
+        fsync без захвата лока — вызывает тот, кто уже держит self._lock.
+
+        Отдельный метод, а не flush_to_disk(): лок в append нереентерабельный,
+        и вызов публичного метода изнутри него вставал бы навсегда (это уже
+        случалось — на 50-й записи, когда срабатывает пачка fsync).
+        """
+        self._since_fsync = 0
+        handle = self._handle
+        if handle is None:
+            return
+        with contextlib.suppress(OSError, ValueError):
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def flush_to_disk(self) -> None:
         """Сбрасывает журнал на диск (fsync): записи переживают потерю питания."""
         with self._lock:
-            self._since_fsync = 0
-            handle = self._handle
-            if handle is None:
-                return
-            with contextlib.suppress(OSError, ValueError):
-                handle.flush()
-                os.fsync(handle.fileno())
+            self._fsync_locked()
 
     def close(self) -> None:
         """Сбрасывает и закрывает журнал (вызывается в конце сортировки)."""
@@ -1746,7 +1756,8 @@ def _organize_files_impl(
     if stats["journal_trimmed"]:
         log(f"  🗜 Журнал отмены: удалено старых записей: {stats['journal_trimmed']}")
     if stats["backups_removed"]:
-        log(f"  🧹 Удалено старых бэкапов: {stats['backups_removed']}")
+        action = "Будет удалено" if use_dry_run else "Удалено"
+        log(f"  🧹 {action} старых бэкапов: {stats['backups_removed']}")
     log(f"  Ошибки      : {stats['errors']}")
     if use_recursive and not use_dry_run:
         log(f"  Пустых папок удалено: {stats['empty_dirs_removed']}")
@@ -1810,10 +1821,11 @@ def _cleanup_old_backups(
     Удаляет устаревшие бэкапы заменённых файлов (`<оригинал>.bak-ГГГГММДД_ЧЧММСС`).
 
     Бэкапы создаёт стратегия replace, и без очистки они копятся в папках
-    категорий вечно. Возвращает число удалённых файлов.
+    категорий вечно.
 
     Удаляем только строго узнаваемые имена и только старше retention_days.
-    В dry-run ничего не трогаем — сообщаем, что было бы удалено.
+    Возвращает число удалённых файлов; в dry-run файлы не трогаются, но счётчик
+    показывает, сколько было бы удалено (как stats["moved"] для переносов).
     """
     cutoff = datetime.now() - timedelta(days=retention_days)
     removed_rel: list[str] = []
@@ -1836,6 +1848,7 @@ def _cleanup_old_backups(
             backup_path = Path(entry.path)
             masked = _mask_path_for_log(backup_path, source_path)
             if dry_run:
+                removed += 1
                 log(f"  🧹 Старый бэкап будет удалён: {masked}")
                 continue
             try:

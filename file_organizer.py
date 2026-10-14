@@ -225,7 +225,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             if stats.get('content_duplicates'):
                 print(f"Дубликатов по содержимому: {stats['content_duplicates']}")
             if stats.get('backups_removed'):
-                print(f"Удалено старых бэкапов: {stats['backups_removed']}")
+                # dry-run может прийти и из конфига, и из флага
+                planned = bool(args.dry_run) or bool(
+                    config.get("settings", {}).get("dry_run")
+                )
+                action = "Будет удалено" if planned else "Удалено"
+                print(f"{action} старых бэкапов: {stats['backups_removed']}")
             print(f"Ошибок: {stats['errors']}")
             if stats.get('empty_dirs_removed'):
                 print(f"Пустых папок удалено: {stats['empty_dirs_removed']}")
