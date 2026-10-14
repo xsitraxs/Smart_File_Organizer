@@ -2,6 +2,7 @@
 
 import contextlib
 import copy
+import fnmatch
 import hashlib
 import io
 import json
@@ -117,6 +118,10 @@ if not logger.handlers:
 
 CONFIG_FILE = Path(__file__).parent / "config.json"
 UNDO_LOG_FILENAME = ".organizer_undo.json"
+
+# Пользовательский список исключений (формат как у .gitignore). Читается из
+# корня сортируемой папки, сам никогда не сортируется.
+ORGANIZER_IGNORE_FILENAME = ".organizerignore"
 
 # Настраиваемые имена скриптов (можно переопределить в конфиге)
 DEFAULT_SCRIPT_FILES: set[str] = {
@@ -846,7 +851,106 @@ def _add_name(
     keys.add(_name_key(name, case_insensitive))
 
 
-def _scan_files_fast(root: Path, recursive: bool) -> tuple[list[tuple[Path, os.stat_result]], list[str]]:
+# ── .organizerignore ──────────────────────────────────────────────────────────
+
+def _parse_ignore_patterns(text: str) -> list[tuple[str, bool]]:
+    """
+    Разбирает .organizerignore в список пар (шаблон, «отрицание»).
+
+    Формат как у .gitignore: строка — шаблон, «#» — комментарий, пустые строки
+    пропускаются, «!шаблон» возвращает файл обратно в сортировку.
+    """
+    patterns: list[tuple[str, bool]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        negate = line.startswith("!")
+        if negate:
+            line = line[1:].strip()
+        if not line:
+            continue
+        patterns.append((line, negate))
+    return patterns
+
+
+def _load_ignore_patterns(source_dir: Path) -> list[tuple[str, bool]]:
+    """Читает .organizerignore из корня сортируемой папки (нет файла — нет правил)."""
+    path = source_dir / ORGANIZER_IGNORE_FILENAME
+    try:
+        # utf-8-sig: файл, сохранённый «Блокнотом», начинается с BOM.
+        # errors="replace": битые байты не должны мешать сортировке.
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        # Например, на месте файла оказался каталог — сортировка продолжается.
+        logger.warning(f"{ORGANIZER_IGNORE_FILENAME}: не удалось прочитать: {exc}")
+        return []
+    return _parse_ignore_patterns(text)
+
+
+def _ignore_ancestor_names(rel_posix: str, is_dir: bool) -> list[str]:
+    """Имена каталогов на пути — для шаблонов вида «node_modules/»."""
+    parts = rel_posix.split("/")
+    if not is_dir:
+        parts = parts[:-1]
+    return parts
+
+
+def _ignore_pattern_matches(pattern: str, rel_posix: str, is_dir: bool) -> bool:
+    """
+    Один шаблон .organizerignore против относительного пути (разделитель «/»).
+
+    Семантика как у .gitignore:
+    - «*.tmp» (без «/») — совпадение по имени на любом уровне;
+    - «docs/*.pdf» (с «/») — от корня сортируемой папки;
+    - «node_modules/» — каталог и всё внутри, на любом уровне;
+    - «build/cache/» — каталог и всё внутри, от корня.
+    """
+    dir_only = pattern.endswith("/")
+    pattern = pattern.rstrip("/")
+    if not pattern:
+        return False
+    name = rel_posix.rsplit("/", 1)[-1]
+    if dir_only:
+        if "/" in pattern:
+            names = _ignore_ancestor_names(rel_posix, is_dir)
+            return any(
+                fnmatch.fnmatchcase("/".join(names[: i + 1]), pattern)
+                for i in range(len(names))
+            )
+        return any(
+            fnmatch.fnmatchcase(part, pattern)
+            for part in _ignore_ancestor_names(rel_posix, is_dir)
+        )
+    if "/" in pattern:
+        return fnmatch.fnmatchcase(rel_posix, pattern)
+    if fnmatch.fnmatchcase(name, pattern):
+        return True
+    # Без «/» шаблон действует и на каталоги: «*.bak» исключает папку «old.bak» целиком
+    return any(
+        fnmatch.fnmatchcase(part, pattern)
+        for part in _ignore_ancestor_names(rel_posix, is_dir)
+    )
+
+
+def _matches_ignore(
+    rel_posix: str, patterns: list[tuple[str, bool]], is_dir: bool
+) -> bool:
+    """Применяет шаблоны по порядку: решает последнее совпадение (как в .gitignore)."""
+    ignored = False
+    for pattern, negate in patterns:
+        if _ignore_pattern_matches(pattern, rel_posix, is_dir):
+            ignored = not negate
+    return ignored
+
+
+def _scan_files_fast(
+    root: Path,
+    recursive: bool,
+    ignore_dir: Optional[Callable[[Path], bool]] = None,
+) -> tuple[list[tuple[Path, os.stat_result]], list[str]]:
     """
     Быстрый сбор файлов с помощью os.scandir() вместо Path.rglob()/iterdir().
 
@@ -858,6 +962,10 @@ def _scan_files_fast(root: Path, recursive: bool) -> tuple[list[tuple[Path, os.s
     M8 fix: ошибки сканирования больше не проглатываются молча — недоступные
     подпапки возвращаются вызывающему коду, который учитывает их в статистике,
     вместо ложного «Нечего делать».
+
+    ignore_dir: необязательный предикат «каталог исключён». Исключённые каталоги
+    не обходятся вовсе — на больших папках (node_modules, .venv) это экономит
+    весь обход, а не только перенос файлов.
     """
     result: list[tuple[Path, os.stat_result]] = []
     scan_errors: list[str] = []
@@ -873,6 +981,8 @@ def _scan_files_fast(root: Path, recursive: bool) -> tuple[list[tuple[Path, os.s
                             if entry.is_file(follow_symlinks=True):
                                 result.append((Path(entry.path), entry.stat()))
                             elif entry.is_dir(follow_symlinks=False):
+                                if ignore_dir is not None and ignore_dir(Path(entry.path)):
+                                    continue
                                 stack.append(entry.path)
                             # Прочие типы (FIFO, сокеты, битые симлинки) не сортируются
                         except OSError:
@@ -1272,7 +1382,7 @@ def organize_files(
         return {
             "moved": 0, "skipped": 0, "errors": 0,
             "duplicates": 0, "content_duplicates": 0, "empty_dirs_removed": 0,
-            "journal_trimmed": 0, "backups_removed": 0,
+            "journal_trimmed": 0, "backups_removed": 0, "ignored": 0,
             "by_category": {}, "skipped_concurrent": True,
         }
 
@@ -1340,7 +1450,7 @@ def _organize_files_impl(
     stats: dict[str, Any] = {
         "moved": 0, "skipped": 0, "errors": 0,
         "duplicates": 0, "content_duplicates": 0, "empty_dirs_removed": 0,
-        "journal_trimmed": 0, "backups_removed": 0,
+        "journal_trimmed": 0, "backups_removed": 0, "ignored": 0,
         "by_category": {},
     }
     session_log: list[dict] = []
@@ -1376,8 +1486,33 @@ def _organize_files_impl(
             source_path, category_names, backup_retention_days, use_dry_run, log
         )
 
+    # ── .organizerignore: пользовательские исключения ──────────────────────────
+    ignore_patterns = _load_ignore_patterns(source_path)
+    ignored_files = 0
+    ignored_dirs = 0
+
+    def _dir_is_ignored(dir_path: Path) -> bool:
+        """True — каталог исключён шаблонами .organizerignore (сам или родителем)."""
+        if not ignore_patterns:
+            return False
+        try:
+            rel = dir_path.relative_to(source_path).as_posix()
+        except ValueError:
+            return False
+        return _matches_ignore(rel, ignore_patterns, is_dir=True)
+
+    def _ignored_dir(dir_path: Path) -> bool:
+        """Предикат для сканера: исключённый каталог внутрь не пускаем и считаем."""
+        nonlocal ignored_dirs
+        if _dir_is_ignored(dir_path):
+            ignored_dirs += 1
+            return True
+        return False
+
     # ── Сбор файлов через os.scandir() — получаем stat бесплатно ──────────────
-    raw_file_stats, scan_errors = _scan_files_fast(source_path, use_recursive)
+    raw_file_stats, scan_errors = _scan_files_fast(
+        source_path, use_recursive, _ignored_dir if ignore_patterns else None
+    )
     # M8 fix: недоступные подпапки/файлы видны в статистике, а не молчат
     if scan_errors:
         log(f"  ⚠  Не удалось прочитать объектов: {len(scan_errors)}")
@@ -1391,6 +1526,7 @@ def _organize_files_impl(
     category_names_lower: frozenset = frozenset(c.lower() for c in category_names)
 
     def _should_skip(f: Path) -> bool:
+        nonlocal ignored_files
         if settings.get("ignore_hidden", True) and f.name.startswith("."):
             return True
         # Свой пробный файл (проверка регистра ФС) не сортируем даже при
@@ -1405,11 +1541,20 @@ def _organize_files_impl(
             return True
         try:
             rel = f.relative_to(source_path)
+            # Шаблоны .organizerignore: файл просто не сортируем (см. README).
+            if ignore_patterns and _matches_ignore(
+                rel.as_posix(), ignore_patterns, is_dir=False
+            ):
+                ignored_files += 1
+                return True
             # M12 fix: служебные файлы самого органайзера пропускаем только в КОРНЕ
             # сортируемой папки. Раньше сравнение шло по basename для любого уровня —
             # пользовательский config.json или organizer_core.py в подпапке
-            # молча игнорировался.
-            if len(rel.parts) == 1 and f.name in script_files:
+            # молча игнорировался. Сам .organizerignore тоже не сортируем: иначе
+            # при ignore_hidden=false он уезжал бы в other/ и правила «терялись».
+            if len(rel.parts) == 1 and (
+                f.name in script_files or f.name == ORGANIZER_IGNORE_FILENAME
+            ):
                 return True
             first_part_lower = rel.parts[0].lower()
             if first_part_lower in category_names_lower:
@@ -1424,6 +1569,14 @@ def _organize_files_impl(
         return False
 
     files_with_stat = [(f, st) for f, st in raw_file_stats if not _should_skip(f)]
+    # ignored_files — файлы, пропущенные поштучно; файлы внутри исключённых
+    # каталогов даже не сканируются, поэтому их число не считаем (видно по папкам)
+    stats["ignored"] = ignored_files
+    if ignore_patterns:
+        log(
+            f"  🙈 {ORGANIZER_IGNORE_FILENAME}: файлов пропущено: {ignored_files}, "
+            f"папок: {ignored_dirs}"
+        )
     total = len(files_with_stat)
     log(f"  Файлов для обработки: {total}\n")
 
@@ -1715,6 +1868,11 @@ def _organize_files_impl(
         for dirpath_str, _subdirs, _ in os.walk(str(source_path), topdown=False):
             dirpath = Path(dirpath_str)
             if dirpath == source_path:
+                continue
+            # Исключённые каталоги — не наша территория: пользователь просил их
+            # не трогать, поэтому и пустыми не удаляем (это касается и подпапок
+            # внутри исключённого каталога).
+            if _dir_is_ignored(dirpath):
                 continue
             if is_protected_dir(dirpath):
                 log(f"  ⚠  Пропущена защищённая директория: {dirpath.name}")
