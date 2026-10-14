@@ -8,8 +8,10 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
+import unicodedata
 from collections import defaultdict
 from datetime import datetime
 from functools import lru_cache
@@ -20,11 +22,87 @@ from typing import Any, Callable, Optional
 # Запрещают '/', '\\', '..', абсолютные пути и любые небезопасные символы.
 _CATEGORY_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
+# Зарезервированные имена Windows: каталог с таким именем (даже с расширением)
+# ведёт себя как устройство, поэтому создание папки категории на Windows
+# ломается непредсказуемо. Запрещаем на ВСЕХ платформах, чтобы один и тот же
+# config.json вёл себя одинаково везде.
+WINDOWS_RESERVED_NAMES: frozenset = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+
 # ── Настройка логирования ───────────────────────────────────────────────────────
+
+class _EncodingSafeStream:
+    """
+    Обёртка потока, которая не падает на символах, отсутствующих в кодировке.
+
+    На Windows консоль по умолчанию работает в cp1252, где нет ни кириллицы,
+    ни рамок «─», ни эмодзи из наших логов: обычная запись падает с
+    UnicodeEncodeError (в logging это превращается в «--- Logging error ---»).
+    Здесь такие символы заменяются на '?', а логи остаются читаемыми.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        try:
+            written = self._stream.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(self._stream, "encoding", None) or "utf-8"
+            sanitized = text.encode(encoding, "replace").decode(encoding, "replace")
+            written = self._stream.write(sanitized)
+        return int(written)
+
+    def flush(self) -> None:
+        with contextlib.suppress(Exception):
+            self._stream.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._stream, "isatty", lambda: False)())
+
+    def __getattr__(self, item: str) -> Any:  # прозрачно отдаём остальные атрибуты
+        return getattr(self._stream, item)
+
+
+def _make_log_handler() -> logging.StreamHandler:
+    """StreamHandler, устойчивый к узким консольным кодировкам (Windows cp1252)."""
+    return logging.StreamHandler(_EncodingSafeStream(sys.stderr))
+
+
+def _harden_console_encoding() -> None:
+    """
+    Делает stdout/stderr пригодными для печати кириллицы и рамок.
+
+    Проблема Windows: когда вывод перенаправлен (`python file_organizer.py
+    > log.txt`) или читается пайпом, Python берёт локальную кодировку
+    (cp1252/cp866), и обычный print() русских строк падает с
+    UnicodeEncodeError — в лучшем случае в файле оказываются \\uXXXX-escape.
+    Интерактивная консоль Windows работает через Unicode API, поэтому её
+    кодировку мы не меняем: там добавляем только страховку errors='replace'.
+
+    Для перенаправленного вывода включаем UTF-8 (как делают git и ripgrep):
+    в файле/пайпе читаемая кириллица важнее «совместимости» с cp1252.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # не TextIOWrapper (StringIO и т.п.) — пропускаем
+            continue
+        try:
+            is_tty = bool(getattr(stream, "isatty", lambda: False)())
+            if is_tty:
+                reconfigure(errors="replace")
+            else:
+                reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError, AttributeError, LookupError):
+            logger.debug("Не удалось перенастроить кодировку потока вывода", exc_info=True)
+
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
-    handler = logging.StreamHandler()
+    handler = _make_log_handler()
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
@@ -51,14 +129,65 @@ DEFAULT_SCRIPT_FILES: set[str] = {
 
 # Абсолютные пути к защищённым системным директориям (Unix + Windows)
 # Защищаются ТОЛЬКО системные директории, НЕ пользовательские (/tmp, /home/user)
-_PROTECTED_BASE_PATHS = (
-    "/", "/root",
+_PROTECTED_EXACT_PATHS = (
+    "/", "/root", "/home",
     "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64",
     "/var", "/boot", "/dev", "/proc", "/sys",
     "C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)",
 )
 
-PROTECTED_ABS_PATHS: list[Path] = [Path(p) for p in _PROTECTED_BASE_PATHS]
+# Каталоги, у которых защищаются и все подпапки. Корня "/" и пользовательских
+# /root, /home здесь нет намеренно: иначе защищённым стало бы вообще всё
+# (/home/пользователь/Загрузки тоже должен сортироваться).
+_PROTECTED_TREE_PATHS = tuple(
+    p for p in _PROTECTED_EXACT_PATHS if p not in ("/", "/root", "/home")
+)
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    """True, если path лежит внутри parent (сам parent не считается)."""
+    if path == parent:
+        return False
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _expand_with_resolved(paths: "tuple[str, ...] | set[Path]") -> set[Path]:
+    """
+    Литеральные пути + их resolve()-формы.
+
+    Нужно для macOS: /etc, /var, /bin и /tmp — симлинки в /private/..., так что
+    проверка только по литеральному пути пропускала бы organize_files("/etc").
+    Обратная ситуация (аргумент — симлинк на системный путь) ловится тем же.
+    """
+    expanded: set[Path] = set()
+    for raw in paths:
+        path = Path(raw)
+        expanded.add(path)
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            expanded.add(path.resolve())
+    return expanded
+
+
+_PROTECTED_EXACT: set[Path] = _expand_with_resolved(_PROTECTED_EXACT_PATHS)
+_PROTECTED_TREES: set[Path] = _expand_with_resolved(_PROTECTED_TREE_PATHS)
+# Домашний каталог пользователя — только точным совпадением (подпапки сортируются)
+with contextlib.suppress(OSError, RuntimeError, ValueError):
+    _PROTECTED_EXACT.add(Path.home())
+    _PROTECTED_EXACT.add(Path.home().resolve())
+
+# macOS: пользовательский temp лежит внутри защищённого /var — /var/folders/....
+# Без этого исключения tempfile.mkdtemp() на macOS попадал бы под защиту /var
+# и ни один скрипт не смог бы рассортировать временную папку.
+_USER_TEMP_TREES: set[Path] = _expand_with_resolved(
+    ("/var/folders", "/private/var/folders")
+)
+
+# Публичный список для обратной совместимости
+PROTECTED_ABS_PATHS: list[Path] = [Path(p) for p in _PROTECTED_EXACT_PATHS]
 
 # Лимиты безопасности
 MAX_UNIQUE_PATH_ATTEMPTS = 1000  # Защита от DoS
@@ -145,6 +274,10 @@ def _validate_category_name(name: str) -> bool:
     if name.startswith(".") or name == "..":
         return False
     if os.path.isabs(name):
+        return False
+    # Зарезервированные имена Windows (con, nul, com1, lpt1, …)
+    if name.lower().split(".")[0] in WINDOWS_RESERVED_NAMES:
+        logger.warning(f"config.json: имя категории зарезервировано в Windows: {name!r}")
         return False
     # Разрешаем только безопасные символы
     return bool(_CATEGORY_NAME_RE.match(name))
@@ -401,83 +534,193 @@ def is_protected_dir(dirpath: Path) -> bool:
     Проверяет, является ли директория защищённой системной.
 
     Защищаются:
-    - Точные совпадения с критическими путями: /, /root, /home, домашний каталог пользователя
-    - Системные директории и их подпапки (/etc, /etc/..., /usr, /usr/..., /bin, /bin/..., etc.)
+    - Точные совпадения с критическими путями: /, /root, /home, домашний каталог
+    - Системные директории и их подпапки (/etc, /etc/..., /usr, /usr/..., ...)
 
     НЕ защищаются (пользовательские данные):
-    - /tmp и его подпапки
-    - /home/user/... (но /home как таковое защищается)
+    - /tmp, /var/folders (macOS temp) и их подпапки
+    - /home/user/... и /root/... (но /home и /root как таковые защищаются)
+
+    Пути сравниваются и в resolve()-форме: на macOS /etc и /var — симлинки
+    в /private/..., и без этого проверка organize_files("/etc") проходила бы.
     """
     try:
         resolved = dirpath.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
 
-        # 1. Точные критические пути (включая сами системные директории)
-        critical_exact = {
-            Path("/"), Path("/root"), Path("/home"),
-            Path("/etc"), Path("/usr"), Path("/bin"), Path("/sbin"),
-            Path("/lib"), Path("/lib64"), Path("/var"), Path("/boot"),
-            Path("/dev"), Path("/proc"), Path("/sys"),
-        }
-        with contextlib.suppress(OSError, RuntimeError):
-            critical_exact.add(Path.home().resolve())
-        # Windows
-        critical_exact.add(Path("C:\\Windows"))
-        critical_exact.add(Path("C:\\Program Files"))
-        critical_exact.add(Path("C:\\Program Files (x86)"))
+    if resolved in _PROTECTED_EXACT:
+        return True
 
-        if resolved in critical_exact:
-            return True
+    # Пользовательский temp не защищаем, даже если формально он лежит внутри
+    # системного каталога (macOS: /var/folders/... внутри /private/var).
+    for temp_root in _USER_TEMP_TREES:
+        if _is_within(resolved, temp_root):
+            return False
 
-        # 2. Подпапки системных директорий
-        system_protected = [
-            Path("/etc"), Path("/usr"), Path("/bin"), Path("/sbin"),
-            Path("/lib"), Path("/lib64"), Path("/var"), Path("/boot"),
-            Path("/dev"), Path("/proc"), Path("/sys"),
-            Path("C:\\Windows"), Path("C:\\Program Files"), Path("C:\\Program Files (x86)"),
-        ]
-        for protected in system_protected:
-            try:
-                # relative_to возвращает относительный путь если resolved внутри protected
-                # Исключаем сам protected (уже проверен в critical_exact)
-                if resolved != protected:
-                    resolved.relative_to(protected)
-                    return True
-            except ValueError:
-                continue
-
-    except (OSError, ValueError):
-        pass
-    return False
+    return any(_is_within(resolved, protected) for protected in _PROTECTED_TREES)
 
 
-def _fs_is_case_insensitive() -> bool:
+# ── Особенности файловой системы: регистр и Unicode ────────────────────────────
+
+# Кэш результатов пробника: регистр может отличаться от каталога к каталогу
+# (APFS умеет быть case-sensitive; Windows — per-directory через fsutil).
+_case_sensitivity_cache: dict[str, bool] = {}
+_case_sensitivity_lock = threading.Lock()
+
+# В имени пробного файла обязан быть символ в верхнем регистре, иначе
+# сравнение с lower-вариантом не имеет смысла.
+CASE_PROBE_PREFIX = ".organizer_CaseProbe_"
+
+
+def _platform_case_guess() -> bool:
     """
-    Эвристика: ФС по умолчанию нечувствительна к регистру.
+    Платформенная эвристика: ФС «по умолчанию» нечувствительна к регистру.
 
-    M9 fix: раньше проверялось только `os.name == "nt"`, из-за чего macOS
-    (APFS/HFS+ по умолчанию case-insensitive) считался case-sensitive —
-    `Photo.JPG` и `photo.jpg` давали конфликт уровня ФС вместо `_1`.
+    Используется ТОЛЬКО как fallback, когда реальный пробник невозможен
+    (каталог только для чтения и т.п.). Основной путь —
+    _fs_is_case_insensitive(directory) с реальной проверкой ФС.
     """
     return os.name == "nt" or sys.platform == "darwin"
+
+
+def _probe_case_sensitivity(directory: Path) -> Optional[bool]:
+    """
+    Реально проверяет ФС на чувствительность к регистру.
+
+    Создаёт временный файл со смешанным регистром и смотрит, виден ли он под
+    именем в нижнем регистре. Возвращает None, если проверить нельзя (нет прав,
+    каталог недоступен) — тогда вызывающий использует платформенную эвристику.
+
+    Точнее догадки по платформе: APFS можно отформатировать как case-sensitive,
+    а Windows умеет включать регистрозависимость для отдельного каталога —
+    в обоих случаях платформенная эвристика даёт неверный ответ.
+    """
+    try:
+        if not Path(directory).is_dir():
+            return None
+        fd, probe_str = tempfile.mkstemp(prefix=CASE_PROBE_PREFIX, dir=str(directory))
+    except OSError:
+        return None
+
+    probe = Path(probe_str)
+    try:
+        os.close(fd)
+        lowered = probe.with_name(probe.name.lower())
+        if lowered.name == probe.name:  # pragma: no cover - префикс содержит верхний регистр
+            return None
+        return lowered.exists()
+    except OSError:
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            probe.unlink()
+
+
+def _fs_is_case_insensitive(directory: Optional[Path] = None) -> bool:
+    """
+    Нечувствительна ли ФС к регистру?
+
+    Args:
+        directory: каталог, для которого нужен ответ. Если задан — выполняется
+            реальный пробник ФС с кэшированием по каталогу. Если не задан (или
+            пробник невозможен) — платформенная эвристика как fallback.
+    """
+    if directory is None:
+        return _platform_case_guess()
+
+    try:
+        key = str(Path(directory).resolve())
+    except (OSError, ValueError):
+        key = str(directory)
+
+    with _case_sensitivity_lock:
+        cached = _case_sensitivity_cache.get(key)
+    if cached is not None:
+        return cached
+
+    probed = _probe_case_sensitivity(Path(directory))
+    result = _platform_case_guess() if probed is None else probed
+
+    with _case_sensitivity_lock:
+        _case_sensitivity_cache[key] = result
+    return result
+
+
+def _normalize_name(name: str) -> str:
+    """
+    Unicode-нормализация имени файла (NFC).
+
+    macOS (APFS/HFS+) хранит имена в NFD: «й» = «и» + U+0306, «é» = «e» + U+0301.
+    Имя, введённое пользователем в NFC, и то же имя, прочитанное с диска в NFD, —
+    это ОДНА запись ФС. Без нормализации мы считали бы их разными файлами
+    и могли молча перезаписать существующий файл при перемещении.
+    """
+    try:
+        return unicodedata.normalize("NFC", name)
+    except (TypeError, ValueError):  # pragma: no cover - защита от не-строк
+        return name
+
+
+def _name_key(name: str, case_insensitive: bool) -> str:
+    """
+    Ключ сравнения имён файлов для конкретной ФС.
+
+    Учитывает обе особенности одновременно: Unicode-нормализацию (NFC) и
+    регистр (если ФС регистронезависима).
+    """
+    key = _normalize_name(name)
+    return key.lower() if case_insensitive else key
+
+
+def _max_path_length() -> Optional[int]:
+    """Лимит длины пути для текущей ОС (None — если лимита нет)."""
+    if os.name == "nt":
+        # Windows MAX_PATH (260) минус завершающий NUL
+        return 260 - 1
+    if sys.platform == "darwin":
+        # POSIX PATH_MAX на macOS — 1024 байта
+        return 1024
+    return None
+
+
+def _path_too_long(path: Path) -> bool:
+    """
+    Превышает ли путь лимит ОС?
+
+    Windows с выключенной поддержкой длинных путей (по умолчанию) падает на
+    путях длиннее 259 символов с невнятным OSError уже в момент перемещения.
+    Лучше явно посчитать это ошибкой конкретного файла и сообщить пользователю.
+    """
+    limit = _max_path_length()
+    if limit is None:
+        return False
+    try:
+        return len(str(path)) > limit
+    except (TypeError, ValueError):  # pragma: no cover
+        return False
 
 
 def _get_unique_path(
     target_dir: Path,
     filename: str,
     existing_names: Optional[set[str]] = None,
-    existing_names_lower: Optional[set[str]] = None,
+    existing_keys: Optional[set[str]] = None,
 ) -> Path:
     """
     Возвращает путь без конфликта имён, добавляя _1, _2, …
 
-    На case-insensitive ФС (Windows, macOS HFS+/APFS по умолчанию) сравнение
-    идёт без учёта регистра, чтобы "File.TXT" и "file.txt" считались одним
-    и тем же файлом и duplicate_strategy=rename отрабатывала корректно.
+    Конфликт определяется так, как его видит сама ФС:
+    - на регистронезависимой ФС «File.TXT» и «file.txt» — одно имя;
+    - имена сравниваются в Unicode-нормализации NFC, поэтому «café» (NFC) и
+      «café» (NFD, как хранит macOS) тоже считаются одним именем.
 
-    Принимает опциональные pre-scanned наборы existing_names (и его
-    lower-case версию existing_names_lower). Если они переданы — работает
-    полностью без I/O (O(1) на проверку). Если нет — сканирует директорию
-    один раз вместо N вызовов exists().
+    Чувствительность ФС определяется реальным пробником этого каталога
+    (_fs_is_case_insensitive), а не догадкой по платформе.
+
+    Принимает опциональные pre-scanned наборы: existing_names (имена как есть)
+    и existing_keys (их ключи сравнения). Если переданы — работает без I/O.
+    Если нет — сканирует директорию один раз вместо N вызовов exists().
     """
     target = target_dir / filename
     if existing_names is None:
@@ -487,18 +730,12 @@ def _get_unique_path(
         except OSError:
             existing_names = set()
 
-    # На case-insensitive ФС (Windows, macOS) сравниваем в lower-case.
-    case_insensitive = _fs_is_case_insensitive()
-    if case_insensitive:
-        if existing_names_lower is None:
-            existing_names_lower = {n.lower() for n in existing_names}
-        existing_lower = existing_names_lower
+    case_insensitive = _fs_is_case_insensitive(target_dir)
+    if existing_keys is None:
+        existing_keys = {_name_key(n, case_insensitive) for n in existing_names}
 
-        def _exists(name: str) -> bool:
-            return name.lower() in existing_lower
-    else:
-        def _exists(name: str) -> bool:
-            return name in existing_names
+    def _exists(name: str) -> bool:
+        return _name_key(name, case_insensitive) in existing_keys
 
     if not _exists(filename):
         return target
@@ -514,21 +751,23 @@ def _get_unique_path(
 
 
 def _name_in_set(
-    name: str, names: set[str], names_lower: set[str], case_insensitive: bool
+    name: str, names: set[str], keys: set[str], case_insensitive: bool
 ) -> bool:
-    """Проверяет наличие имени в наборе с учётом регистра ФС (M9)."""
-    if case_insensitive:
-        return name.lower() in names_lower
-    return name in names
+    """
+    Есть ли имя в наборе (с учётом регистра ФС и Unicode-нормализации)?
+
+    `keys` — предвычисленные ключи сравнения существующих имён
+    (см. _name_key), построенные с тем же значением case_insensitive.
+    """
+    return _name_key(name, case_insensitive) in keys
 
 
 def _add_name(
-    name: str, names: set[str], names_lower: set[str], case_insensitive: bool
+    name: str, names: set[str], keys: set[str], case_insensitive: bool
 ) -> None:
-    """Регистрирует созданное имя в наборе (с учётом регистра ФС) (M9)."""
+    """Регистрирует созданное имя в наборе имён и в наборе ключей сравнения."""
     names.add(name)
-    if case_insensitive:
-        names_lower.add(name.lower())
+    keys.add(_name_key(name, case_insensitive))
 
 
 def _scan_files_fast(root: Path, recursive: bool) -> tuple[list[tuple[Path, os.stat_result]], list[str]]:
@@ -830,6 +1069,10 @@ def _organize_files_impl(
     def _should_skip(f: Path) -> bool:
         if settings.get("ignore_hidden", True) and f.name.startswith("."):
             return True
+        # Свой пробный файл (проверка регистра ФС) не сортируем даже при
+        # ignore_hidden=false: он живёт миллисекунды и не является данными.
+        if f.name.startswith(CASE_PROBE_PREFIX):
+            return True
         try:
             rel = f.relative_to(source_path)
             # M12 fix: служебные файлы самого органайзера пропускаем только в КОРНЕ
@@ -945,19 +1188,19 @@ def _organize_files_impl(
             except OSError:
                 existing_names = set()
 
-            # M9 fix: на case-insensitive ФС (Windows/macOS) сравнение имён
-            # идёт без учёта регистра — Photo.JPG и photo.jpg конфликтуют.
-            case_insensitive = _fs_is_case_insensitive()
-            existing_names_lower = (
-                {n.lower() for n in existing_names} if case_insensitive else set()
-            )
+            # Коллизии считаем так, как их видит сама ФС: реальный пробник
+            # каталога (регистр) + Unicode-нормализация NFC (macOS хранит NFD).
+            case_insensitive = _fs_is_case_insensitive(target_cat_dir)
+            existing_keys: set[str] = {
+                _name_key(n, case_insensitive) for n in existing_names
+            }
 
             for file_path, _ in batch:
                 target_path = target_cat_dir / file_path.name
 
                 try:
                     if _name_in_set(
-                        file_path.name, existing_names, existing_names_lower, case_insensitive
+                        file_path.name, existing_names, existing_keys, case_insensitive
                     ):
                         if dup_strategy == "skip":
                             masked = _mask_path_for_log(file_path, source_path)
@@ -980,16 +1223,28 @@ def _organize_files_impl(
                                 target_cat_dir,
                                 backup_name,
                                 existing_names,
-                                existing_names_lower,
+                                existing_keys,
                             )
+                            if _path_too_long(backup_path):
+                                log(
+                                    f"  ✗  Путь слишком длинный для этой ОС "
+                                    f"(лимит {_max_path_length()} символов): "
+                                    f"{_mask_path_for_log(file_path, source_path)}"
+                                )
+                                stats["errors"] += 1
+                                _report_move_progress()
+                                continue
+
                             try:
                                 shutil.move(str(target_path), str(backup_path))
                                 existing_names.discard(file_path.name)
-                                existing_names_lower.discard(file_path.name.lower())
+                                existing_keys.discard(
+                                    _name_key(file_path.name, case_insensitive)
+                                )
                                 _add_name(
                                     backup_path.name,
                                     existing_names,
-                                    existing_names_lower,
+                                    existing_keys,
                                     case_insensitive,
                                 )
                                 masked = _mask_path_for_log(file_path, source_path)
@@ -1002,8 +1257,8 @@ def _organize_files_impl(
                                     backup_entry: dict[str, Any] = {
                                         "timestamp": datetime.now().isoformat(),
                                         "action": "backup",
-                                        "source": str(backup_path.relative_to(source_path)),
-                                        "destination": str(target_path.relative_to(source_path)),
+                                        "source": backup_path.relative_to(source_path).as_posix(),
+                                        "destination": target_path.relative_to(source_path).as_posix(),
                                         "original_name": file_path.name,
                                     }
                                     undo_writer.append(backup_entry)
@@ -1018,11 +1273,21 @@ def _organize_files_impl(
                                 target_cat_dir,
                                 file_path.name,
                                 existing_names,
-                                existing_names_lower,
+                                existing_keys,
                             )
                             masked = _mask_path_for_log(file_path, source_path)
                             log(f"  ⚠  Переименован: {masked} → {target_path.name}")
                             stats["duplicates"] += 1
+
+                    if _path_too_long(target_path):
+                        log(
+                            f"  ✗  Путь слишком длинный для этой ОС "
+                            f"(лимит {_max_path_length()} символов): "
+                            f"{_mask_path_for_log(file_path, source_path)}"
+                        )
+                        stats["errors"] += 1
+                        _report_move_progress()
+                        continue
 
                     shutil.move(str(file_path), str(target_path))
                     # Добавляем новое имя в set, чтобы следующий файл с тем же
@@ -1030,16 +1295,18 @@ def _organize_files_impl(
                     _add_name(
                         target_path.name,
                         existing_names,
-                        existing_names_lower,
+                        existing_keys,
                         case_insensitive,
                     )
 
                     masked = _mask_path_for_log(file_path, source_path)
                     log(f"  ✓  {masked}  ➜  {category}/{target_path.name}")
 
+                    # Журнал хранит пути в POSIX-виде: записанный на Windows
+                    # журнал должен читаться на Linux/macOS и наоборот.
                     try:
-                        rel_source = str(file_path.relative_to(source_path))
-                        rel_dest = str(target_path.relative_to(source_path))
+                        rel_source = file_path.relative_to(source_path).as_posix()
+                        rel_dest = target_path.relative_to(source_path).as_posix()
                     except ValueError:
                         rel_source = file_path.name
                         rel_dest = target_path.name
@@ -1444,9 +1711,11 @@ class _DebounceScheduler:
         self,
         on_flush: Callable[[int], None],
         is_stopped: Optional[Callable[[], bool]] = None,
+        ignore_hidden: bool = True,
     ) -> None:
         self._on_flush = on_flush
         self._is_stopped = is_stopped or (lambda: False)
+        self._ignore_hidden = ignore_hidden
         self._pending: set[str] = set()
         self._timer: Optional[threading.Timer] = None
         self._tlock = threading.Lock()
@@ -1463,6 +1732,15 @@ class _DebounceScheduler:
         if self._cancelled or self._is_stopped() or not path_str:
             return
         if _is_incomplete_path(path_str):
+            return
+        # Скрытые файлы и служебные файлы органайзера всё равно не сортируются
+        # (см. _should_skip) — не будим мониторинг впустую.
+        name = Path(path_str).name
+        if self._ignore_hidden and name.startswith("."):
+            return
+        # Пробный файл проверки регистра ФС не должен будить сортировку,
+        # даже если пользователь отключил игнорирование скрытых файлов.
+        if name.startswith(CASE_PROBE_PREFIX):
             return
         now = time.monotonic()
         with self._tlock:
@@ -1605,6 +1883,7 @@ def start_monitoring(
             scheduler = _DebounceScheduler(
                 on_flush=_run_sort,
                 is_stopped=lambda: _monitoring_stop_event.is_set(),
+                ignore_hidden=bool(config.get("settings", {}).get("ignore_hidden", True)),
             )
             handler = _WatchdogHandler(scheduler)
             observer = Observer()

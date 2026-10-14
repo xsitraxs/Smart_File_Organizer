@@ -9,6 +9,7 @@
 """
 
 import copy
+import io as io_mod
 import json
 import os
 import shutil
@@ -62,7 +63,11 @@ class TestPathSafety(unittest.TestCase):
     """Тесты безопасности путей."""
 
     def setUp(self):
-        self.source_dir = Path("/tmp/test_source").resolve()
+        # Свой временный каталог: литерал "/tmp/..." на Windows указал бы на
+        # C:\tmp, которого на чистой машине может не быть.
+        self._root = Path(tempfile.mkdtemp())
+        self.source_dir = self._root / "source"
+        self.source_dir.mkdir()
 
     def test_valid_path(self):
         """Валидный путь внутри директории."""
@@ -71,19 +76,23 @@ class TestPathSafety(unittest.TestCase):
 
     def test_path_traversal(self):
         """Запрет Path Traversal через '..'."""
-        # Создаём тестовую структуру
-        self.source_dir.mkdir(exist_ok=True)
         file_path = self.source_dir / ".." / "etc" / "passwd"
         self.assertFalse(_validate_path_safety(file_path, self.source_dir))
 
     def test_absolute_path(self):
         """Абсолютный путь вне директории."""
-        file_path = Path("/etc/passwd")
-        self.assertFalse(_validate_path_safety(file_path, self.source_dir))
+        # Каталог-сосед (не внутри source_dir) — работает на любой ОС
+        outside = Path(tempfile.mkdtemp()) / "passwd"
+        self.assertFalse(_validate_path_safety(outside, self.source_dir))
+
+    def test_absolute_system_path(self):
+        """Системный абсолютный путь вне директории отклоняется."""
+        if os.name == "nt":
+            self.skipTest("Unix-specific")
+        self.assertFalse(_validate_path_safety(Path("/etc/passwd"), self.source_dir))
 
     def tearDown(self):
-        if self.source_dir.exists():
-            shutil.rmtree(self.source_dir, ignore_errors=True)
+        shutil.rmtree(self._root, ignore_errors=True)
 
 
 class TestUniquePath(unittest.TestCase):
@@ -447,53 +456,546 @@ class TestUndoLogFormat(unittest.TestCase):
 
 
 class TestCaseInsensitiveDedup(unittest.TestCase):
-    """Тест case-insensitive проверки имён в _get_unique_path (актуально для Win/macOS)."""
+    """Сравнение имён так, как его видит сама ФС (регистр + Unicode)."""
 
     def setUp(self):
         self.test_dir = Path(tempfile.mkdtemp())
 
     def test_case_handling(self):
-        """На case-insensitive ФС (Windows, macOS) file.txt и FILE.TXT — одно имя (M9)."""
+        """Ответ пробника совпадает с фактическим поведением ФС."""
         from organizer_core import _fs_is_case_insensitive
 
         existing = {"File.TXT"}
         result = _get_unique_path(self.test_dir, "file.txt", existing_names=existing)
-        if _fs_is_case_insensitive():
-            # Windows/macOS: должен получить суффикс
+        if _fs_is_case_insensitive(self.test_dir):
+            # Регистронезависимая ФС: «file.txt» и «File.TXT» — одно имя → суффикс
             self.assertEqual(result.name, "file_1.txt")
         else:
-            # Linux (case-sensitive) — это разные файлы
+            # Регистрозависимая ФС (обычный Linux) — это разные файлы
             self.assertEqual(result.name, "file.txt")
 
-    def test_lower_set_is_used_when_provided(self):
-        """Переданный lower-case набор используется без пересчёта (M9)."""
+    def test_precomputed_keys_are_used(self):
+        """Переданный набор ключей используется без пересчёта и без I/O."""
+        from organizer_core import _fs_is_case_insensitive, _name_key
+
+        ci = _fs_is_case_insensitive(self.test_dir)
         existing = {"File.TXT"}
-        lower = {"file.txt"}
+        keys = {_name_key("File.TXT", ci)}
         result = _get_unique_path(
             self.test_dir,
             "file.txt",
             existing_names=existing,
-            existing_names_lower=lower,
+            existing_keys=keys,
         )
-        # Без учёта регистра имя занято → суффикс; проверяем именно ветку
-        from organizer_core import _fs_is_case_insensitive
-
-        self.assertEqual(
-            result.name,
-            "file_1.txt" if _fs_is_case_insensitive() else "file.txt",
-        )
+        self.assertEqual(result.name, "file_1.txt" if ci else "file.txt")
 
     def test_helpers_case_aware(self):
-        """_name_in_set/_add_name учитывают регистр только на CI-ФС (M9)."""
+        """_name_in_set/_add_name работают с ключами сравнения."""
         from organizer_core import _add_name, _name_in_set
 
         names: set = set()
-        lowers: set = set()
-        _add_name("Photo.JPG", names, lowers, True)
+        keys: set = set()
+        # Ключи построены для регистронезависимой ФС
+        _add_name("Photo.JPG", names, keys, True)
         self.assertIn("Photo.JPG", names)
-        self.assertIn("photo.jpg", lowers)
-        self.assertTrue(_name_in_set("photo.jpg", names, lowers, True))
-        self.assertFalse(_name_in_set("photo.jpg", names, lowers, False))
+        self.assertIn("photo.jpg", keys)
+        self.assertTrue(_name_in_set("photo.jpg", names, keys, True))
+        self.assertTrue(_name_in_set("PHOTO.jpg", names, keys, True))
+        # Несовпадающий регистр на регистрозависимой ФС — другое имя
+        self.assertFalse(_name_in_set("photo.jpg", names, {"Photo.JPG"}, False))
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestCaseSensitivityProbe(unittest.TestCase):
+    """Тест реальной проверки ФС на чувствительность к регистру (вместо догадки)."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def test_probe_matches_actual_fs_behaviour(self):
+        """Пробник возвращает то же, что даёт настоящая проверка файлом."""
+        probe_dir = self.test_dir / "probe_here"
+        probe_dir.mkdir()
+
+        # Независимая проверка: создаём файл со смешанным регистром и смотрим,
+        # виден ли он под другим регистром — это и есть поведение этой ФС.
+        (probe_dir / "MixedCase.TXT").write_text("x")
+        actually_insensitive = (probe_dir / "mixedcase.txt").exists()
+
+        from organizer_core import _probe_case_sensitivity
+
+        self.assertEqual(
+            _probe_case_sensitivity(probe_dir),
+            actually_insensitive,
+            f"Пробник разошёлся с реальным поведением ФС в {probe_dir}",
+        )
+
+    def test_probe_prefix_contains_uppercase(self):
+        """Регрессия: без верхнего регистра в префиксе пробник всегда None.
+
+        mkstemp добавляет только строчные символы, поэтому регистр обязан
+        приходить из префикса — иначе lower-вариант совпадает с оригиналом
+        и проверка бессмысленна.
+        """
+        from organizer_core import CASE_PROBE_PREFIX
+
+        self.assertNotEqual(CASE_PROBE_PREFIX, CASE_PROBE_PREFIX.lower())
+
+    def test_probe_leaves_no_files(self):
+        """Пробный файл не остаётся в каталоге."""
+        before = {p.name for p in self.test_dir.iterdir()}
+        from organizer_core import _probe_case_sensitivity
+
+        _probe_case_sensitivity(self.test_dir)
+        self.assertEqual({p.name for p in self.test_dir.iterdir()}, before)
+
+    def test_probe_returns_none_for_unavailable_dir(self):
+        """Для недоступного каталога пробник возвращает None (нужен fallback)."""
+        from organizer_core import _probe_case_sensitivity
+
+        self.assertIsNone(_probe_case_sensitivity(self.test_dir / "no_such_dir"))
+
+    def test_result_is_cached_per_directory(self):
+        """Результат пробника кэшируется по каталогу."""
+        from organizer_core import _case_sensitivity_cache, _fs_is_case_insensitive
+
+        first = _fs_is_case_insensitive(self.test_dir)
+        key = str(self.test_dir.resolve())
+        self.assertIn(key, _case_sensitivity_cache)
+        # Второй вызов отдаёт кэш (и не создаёт файлов-пробников)
+        before = {p.name for p in self.test_dir.iterdir()}
+        self.assertEqual(_fs_is_case_insensitive(self.test_dir), first)
+        self.assertEqual({p.name for p in self.test_dir.iterdir()}, before)
+
+    def test_no_directory_arg_falls_back_to_platform_guess(self):
+        """Без каталога используется платформенная эвристика."""
+        from organizer_core import _fs_is_case_insensitive, _platform_case_guess
+
+        self.assertEqual(_fs_is_case_insensitive(), _platform_case_guess())
+
+    def test_probe_agrees_with_organize_behaviour(self):
+        """organize_files и пробник согласованы: коллизия регистра обрабатывается."""
+        from organizer_core import _fs_is_case_insensitive
+
+        (self.test_dir / "images").mkdir()
+        (self.test_dir / "images" / "Photo.JPG").write_text("OLD")
+        (self.test_dir / "photo.jpg").write_text("NEW")
+
+        stats = organize_files(str(self.test_dir), verbose=False)
+        ci = _fs_is_case_insensitive(self.test_dir / "images")
+        if ci:
+            # «photo.jpg» конфликтует с «Photo.JPG» → сохраняем оба
+            self.assertEqual(stats["duplicates"], 1)
+            self.assertEqual(len(list((self.test_dir / "images").iterdir())), 2)
+        else:
+            # Регистрозависимая ФС: это разные имена, конфликта нет
+            self.assertEqual(stats["duplicates"], 0)
+        # Данные не потеряны ни в одном случае
+        contents = {p.read_text() for p in (self.test_dir / "images").iterdir() if p.is_file()}
+        self.assertIn("NEW", contents)
+        self.assertIn("OLD", contents)
+
+    def test_probe_file_never_organized(self):
+        """Пробный файл ФС не сортируется даже при ignore_hidden=false."""
+        from organizer_core import CASE_PROBE_PREFIX
+
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["ignore_hidden"] = False
+        probe = self.test_dir / f"{CASE_PROBE_PREFIX}ab12cd"
+        probe.write_text("probe")
+        (self.test_dir / "a.jpg").write_text("jpg")
+
+        organize_files(str(self.test_dir), verbose=False, config=cfg)
+
+        self.assertTrue(probe.exists(), "пробный файл уехал в категорию")
+        for category in ("images", "other"):
+            self.assertFalse((self.test_dir / category / probe.name).exists())
+
+    def test_scheduler_ignores_probe_file(self):
+        """Мониторинг не просыпается на пробном файле проверки регистра."""
+        from organizer_core import CASE_PROBE_PREFIX, _DebounceScheduler
+
+        flushes: list = []
+        sched = _DebounceScheduler(on_flush=lambda n: flushes.append(n))
+        try:
+            sched.schedule(f"{self.test_dir}/{CASE_PROBE_PREFIX}zz99")
+            self.assertEqual(sched.pending_count, 0, "пробный файл разбудил мониторинг")
+            sched.schedule(f"{self.test_dir}/real_file.jpg")
+            self.assertEqual(sched.pending_count, 1)
+        finally:
+            sched.cancel()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestUnicodeNormalization(unittest.TestCase):
+    """Тесты Unicode-нормализации имён (macOS хранит имена в NFD)."""
+
+    NFC_NAME = "caf\u00e9.txt"        # é одним кодпоинтом
+    NFD_NAME = "cafe\u0301.txt"       # e + комбинирующий акут (как на APFS)
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def test_name_key_equalizes_nfc_and_nfd(self):
+        """NFC и NFD формы одного имени дают одинаковый ключ сравнения."""
+        from organizer_core import _name_key
+
+        self.assertEqual(
+            _name_key(self.NFC_NAME, True), _name_key(self.NFD_NAME, True)
+        )
+        self.assertEqual(
+            _name_key(self.NFC_NAME, False), _name_key(self.NFD_NAME, False)
+        )
+
+    def test_name_key_respects_case_flag(self):
+        """Ключ учитывает регистр только на регистронезависимой ФС."""
+        from organizer_core import _name_key
+
+        self.assertNotEqual(_name_key("Photo.JPG", False), _name_key("photo.jpg", False))
+        self.assertEqual(_name_key("Photo.JPG", True), _name_key("photo.jpg", True))
+
+    def test_normalize_name_is_idempotent(self):
+        """Повторная нормализация не меняет результат."""
+        from organizer_core import _normalize_name
+
+        once = _normalize_name(self.NFD_NAME)
+        self.assertEqual(once, self.NFC_NAME)
+        self.assertEqual(_normalize_name(once), once)
+
+    def test_collision_detected_across_unicode_forms(self):
+        """Коллизия ловится между разными формами одного имени.
+
+        Это ключевая регрессия: имя пользователя (NFC) и то же имя с диска
+        (NFD) — одна запись ФС. Без нормализации мы считали их разными и
+        могли молча перезаписать существующий файл.
+        """
+        from organizer_core import _add_name, _name_in_set
+
+        names: set = set()
+        keys: set = set()
+        _add_name(self.NFD_NAME, names, keys, True)
+        self.assertTrue(_name_in_set(self.NFC_NAME, names, keys, True))
+        self.assertTrue(_name_in_set(self.NFD_NAME, names, keys, True))
+        # Постороннее имя по-прежнему не считается коллизией
+        self.assertFalse(_name_in_set("other.txt", names, keys, True))
+
+    def test_unique_path_avoids_overwriting_across_forms(self):
+        """_get_unique_path выдаёт суффикс, если имя занято в другой форме.
+
+        На Linux NFC и NFD — разные файлы, поэтому суффикс здесь необязателен,
+        но он безопасен: лучше лишний «_1», чем перезапись чужого файла.
+        """
+        existing = {self.NFD_NAME}
+        result = _get_unique_path(
+            self.test_dir, self.NFC_NAME, existing_names=existing
+        )
+        self.assertNotEqual(result.name, self.NFC_NAME)
+        self.assertTrue(result.name.startswith("caf"))
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestWindowsNames(unittest.TestCase):
+    """Тесты зарезервированных имён Windows в конфиге."""
+
+    def test_reserved_names_rejected(self):
+        """con/nul/com1/lpt1 и т.п. не могут быть категориями."""
+        from organizer_core import _validate_category_name
+
+        for name in ("con", "prn", "aux", "nul", "com1", "com9", "lpt1", "lpt9"):
+            self.assertFalse(_validate_category_name(name), name)
+
+    def test_reserved_check_is_case_insensitive(self):
+        """Регистр не спасает: 'CON' тоже зарезервировано."""
+        from organizer_core import _validate_category_name
+
+        self.assertFalse(_validate_category_name("CON"))
+        self.assertFalse(_validate_category_name("Lpt1"))
+
+    def test_similar_names_accepted(self):
+        """Похожие, но не зарезервированные имена разрешены."""
+        from organizer_core import _validate_category_name
+
+        for name in ("console", "com10", "lpt10", "nulll", "aux_files", "prn2"):
+            self.assertTrue(_validate_category_name(name), name)
+
+    def test_config_with_reserved_category_rejected(self):
+        """Конфиг с категорией 'con' не проходит валидацию схемы."""
+        from organizer_core import _validate_config_schema
+
+        cfg = {"categories": {"con": ["txt"]}, "settings": {}}
+        self.assertFalse(_validate_config_schema(cfg))
+
+
+class TestPathLengthGuard(unittest.TestCase):
+    """Тесты защиты от путей длиннее лимита ОС (Windows MAX_PATH, macOS)."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def test_short_path_is_fine(self):
+        from organizer_core import _path_too_long
+
+        self.assertFalse(_path_too_long(self.test_dir / "a.txt"))
+
+    def test_limit_depends_on_platform(self):
+        from organizer_core import _max_path_length
+
+        limit = _max_path_length()
+        if os.name == "nt":
+            self.assertEqual(limit, 259)
+        elif sys.platform == "darwin":
+            self.assertEqual(limit, 1024)
+        else:
+            self.assertIsNone(limit)  # на Linux лимита длины пути нет
+
+    def test_long_path_detected_when_limit_is_small(self):
+        """При маленьком лимите длинный путь считается превышающим."""
+        from unittest import mock
+
+        import organizer_core as oc
+
+        long_path = self.test_dir / ("x" * 300)
+        with mock.patch.object(oc, "_max_path_length", return_value=10):
+            self.assertTrue(oc._path_too_long(long_path))
+        self.assertFalse(oc._path_too_long(long_path))  # без патча — нормально
+
+    def test_organize_skips_too_long_paths_without_data_loss(self):
+        """Файлы с превышением лимита не перемещаются и не теряются."""
+        from unittest import mock
+
+        import organizer_core as oc
+
+        (self.test_dir / "a.txt").write_text("content A")
+        (self.test_dir / "b.txt").write_text("content B")
+
+        with mock.patch.object(oc, "_max_path_length", return_value=1):
+            stats = organize_files(str(self.test_dir), verbose=False)
+
+        self.assertEqual(stats["moved"], 0)
+        self.assertGreaterEqual(stats["errors"], 2)
+        # Оба файла на месте, содержимое цело
+        self.assertEqual((self.test_dir / "a.txt").read_text(), "content A")
+        self.assertEqual((self.test_dir / "b.txt").read_text(), "content B")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestEncodingSafeStream(unittest.TestCase):
+    """Тесты устойчивости логов к узким консольным кодировкам (Windows cp1252)."""
+
+    @staticmethod
+    def _narrow_stream() -> tuple:
+        """TextIOWrapper в cp1252 — как консоль Windows по умолчанию."""
+        buf = io_mod.BytesIO()
+        return io_mod.TextIOWrapper(buf, encoding="cp1252"), buf
+
+    def test_cyrillic_does_not_crash_narrow_stream(self):
+        """Печать кириллицы в cp1252 не падает с UnicodeEncodeError."""
+        from organizer_core import _EncodingSafeStream
+
+        stream, buf = self._narrow_stream()
+        safe = _EncodingSafeStream(stream)
+        safe.write("Перемещено: 2\n")  # раньше → UnicodeEncodeError
+        safe.flush()
+        stream.flush()
+        self.assertIn(b"2", buf.getvalue())
+
+    def test_box_drawing_and_emoji_replaced(self):
+        """Рамки и эмодзи заменяются, а не роняют запись."""
+        from organizer_core import _EncodingSafeStream
+
+        stream, buf = self._narrow_stream()
+        safe = _EncodingSafeStream(stream)
+        safe.write("── ✓ файл ➜ папка\n")
+        safe.flush()
+        stream.flush()
+        self.assertTrue(buf.getvalue())  # что-то записалось без исключения
+
+    def test_attributes_are_proxied(self):
+        """Прочие атрибуты потока доступны через обёртку."""
+        from organizer_core import _EncodingSafeStream
+
+        stream, _ = self._narrow_stream()
+        safe = _EncodingSafeStream(stream)
+        self.assertEqual(safe.encoding, "cp1252")
+        self.assertFalse(safe.isatty())
+
+    def test_writes_pass_through_for_wide_encodings(self):
+        """Для широкой кодировки текст пишется без изменений."""
+        from organizer_core import _EncodingSafeStream
+
+        buf = io_mod.BytesIO()
+        wide = io_mod.TextIOWrapper(buf, encoding="utf-8")
+        safe = _EncodingSafeStream(wide)
+        safe.write("Перемещено: 2\n")
+        safe.flush()
+        wide.flush()
+        self.assertEqual(buf.getvalue().decode("utf-8"), "Перемещено: 2\n")
+
+
+class TestConsoleEncodingHardening(unittest.TestCase):
+    """Тесты _harden_console_encoding — вывод CLI в узких локалях (Windows)."""
+
+    class _FakeStream:
+        """Поток-заглушка, запоминающий вызовы reconfigure()."""
+
+        def __init__(self, is_tty: bool, encoding: str = "cp1252") -> None:
+            self._is_tty = is_tty
+            self.encoding = encoding
+            self.calls: list = []
+
+        def isatty(self) -> bool:
+            return self._is_tty
+
+        def reconfigure(self, **kwargs: object) -> None:
+            self.calls.append(kwargs)
+
+    def _call(self, stdout: object, stderr: object) -> None:
+        from unittest import mock
+
+        import organizer_core as oc
+
+        with mock.patch.object(oc.sys, "stdout", stdout), \
+                mock.patch.object(oc.sys, "stderr", stderr):
+            oc._harden_console_encoding()
+
+    def test_pipe_output_switches_to_utf8(self):
+        """Перенаправленный вывод → UTF-8, чтобы кириллица писалась как есть."""
+        out = self._FakeStream(is_tty=False)
+        err = self._FakeStream(is_tty=False)
+        self._call(out, err)
+        for stream in (out, err):
+            self.assertEqual(stream.calls, [{"encoding": "utf-8", "errors": "replace"}])
+
+    def test_tty_keeps_its_encoding(self):
+        """Консоль не переводим на UTF-8 — только страхуемся от исключений."""
+        out = self._FakeStream(is_tty=True, encoding="cp866")
+        err = self._FakeStream(is_tty=True, encoding="cp866")
+        self._call(out, err)
+        for stream in (out, err):
+            self.assertEqual(stream.calls, [{"errors": "replace"}])
+            self.assertEqual(stream.encoding, "cp866")
+
+    def test_stream_without_reconfigure_is_skipped(self):
+        """Потоки без reconfigure (StringIO) не ломают настройку."""
+        class _Plain:
+            encoding = "utf-8"
+
+            def isatty(self) -> bool:
+                return False
+
+        self._call(_Plain(), _Plain())  # не должно бросать
+
+    def test_reconfigure_errors_are_suppressed(self):
+        """Ошибка внутри reconfigure не роняет запуск программы."""
+
+        class _Broken:
+            """Поток, у которого reconfigure всегда падает."""
+
+            encoding = "cp1252"
+
+            def isatty(self) -> bool:
+                return False
+
+            def reconfigure(self, **kwargs: object) -> None:
+                raise ValueError("stream уже используется")
+
+        self._call(_Broken(), _Broken())  # не должно бросать
+
+    def test_cli_writes_cyrillic_despite_narrow_pipe(self):
+        """Регрессия: CLI под cp1252-пайпом печатает читаемый UTF-8, а не escape."""
+        import subprocess as sp
+
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252:strict"}
+        cli = str(Path(__file__).parent / "file_organizer.py")
+
+        with tempfile.TemporaryDirectory() as d:
+            missing = str(Path(d) / "no_such_dir")
+            r = sp.run(
+                [sys.executable, cli, missing],
+                capture_output=True, text=True, timeout=60,
+                encoding="utf-8", errors="replace", env=env,
+            )
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("не найдена", r.stderr)
+        self.assertNotIn("\\u041e", r.stderr)
+
+    def test_cli_summary_is_readable_under_narrow_pipe(self):
+        """Итоговая статистика CLI тоже переживает узкую кодировку."""
+        import subprocess as sp
+
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252:strict"}
+        cli = str(Path(__file__).parent / "file_organizer.py")
+
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "photo.jpg").write_text("jpg")
+            r = sp.run(
+                [sys.executable, cli, d],
+                capture_output=True, text=True, timeout=60,
+                encoding="utf-8", errors="replace", env=env,
+            )
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("Перемещено", r.stdout)
+            self.assertTrue((Path(d) / "images" / "photo.jpg").exists())
+
+
+class TestPortableJournalPaths(unittest.TestCase):
+    """Тесты переносимости журнала отмены между ОС."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "a.txt").write_text("a")
+        (self.test_dir / "sub").mkdir()
+        (self.test_dir / "sub" / "b.pdf").write_text("b")
+
+    def test_journal_uses_posix_separators(self):
+        """Пути в журнале — в POSIX-виде (без '\\'), читаемые на любой ОС."""
+        organize_files(str(self.test_dir), verbose=False)
+        log_path = self.test_dir / UNDO_LOG_FILENAME
+        raw = log_path.read_text(encoding="utf-8")
+        self.assertNotIn("\\", raw, "в журнале есть обратные слеши — не переносимо")
+
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            self.assertNotIn("\\", entry["source"])
+            self.assertNotIn("\\", entry["destination"])
+
+    def test_backup_entries_are_posix_too(self):
+        """Записи о бэкапах (replace) тоже в POSIX-виде."""
+        import copy as _copy
+
+        (self.test_dir / "documents").mkdir()
+        (self.test_dir / "documents" / "a.txt").write_text("OLD")
+        cfg = _copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["duplicate_strategy"] = "replace"
+
+        organize_files(str(self.test_dir), verbose=False, config=cfg)
+        raw = (self.test_dir / UNDO_LOG_FILENAME).read_text(encoding="utf-8")
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if entry.get("action") == "backup":
+                self.assertNotIn("\\", entry["source"])
+                self.assertNotIn("\\", entry["destination"])
+
+    def test_undo_still_works_with_posix_paths(self):
+        """Откат корректно читает POSIX-пути из журнала."""
+        organize_files(str(self.test_dir), verbose=False)
+        stats = undo_last_operation(str(self.test_dir), verbose=False)
+        self.assertEqual(stats["restored"], 2)
+        self.assertEqual(stats["errors"], 0)
+        self.assertTrue((self.test_dir / "a.txt").exists())
+        self.assertTrue((self.test_dir / "sub" / "b.pdf").exists())
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
@@ -1132,6 +1634,74 @@ class TestProtectedDirHardening(unittest.TestCase):
             self.assertFalse(is_protected_dir(Path(d)))
 
 
+class TestProtectedDirResolution(unittest.TestCase):
+    """Защита системных каталогов с учётом симлинков (macOS)."""
+
+    def test_protected_sets_include_resolved_forms(self):
+        """Регрессия (macOS): /etc и /var — симлинки в /private/... .
+
+        Наборы защищённых путей обязаны содержать resolve()-формы, иначе
+        organize_files("/etc") и organize_files("/var/log") на macOS
+        проходили бы проверку — это дыра в защите.
+        """
+        import contextlib
+
+        import organizer_core as oc
+
+        combined = oc._PROTECTED_EXACT | oc._PROTECTED_TREES
+        checked = 0
+        for path in sorted(combined):
+            if not path.exists():
+                continue
+            with contextlib.suppress(OSError, RuntimeError):
+                checked += 1
+                self.assertIn(
+                    path.resolve(), combined,
+                    f"resolve()-форма {path} → {path.resolve()} не защищена",
+                )
+        self.assertGreater(checked, 0, "не проверено ни одного пути")
+
+    def test_symlinked_protected_path_is_still_protected(self):
+        """Путь через симлинк на системный каталог защищён (как на macOS)."""
+        from unittest import mock
+
+        import organizer_core as oc
+
+        root = Path(tempfile.mkdtemp())
+        try:
+            real = root / "private" / "etc"
+            real.mkdir(parents=True)
+            link = root / "etc"
+            try:
+                link.symlink_to(real)
+            except (OSError, NotImplementedError):
+                self.skipTest("симлинки недоступны на этой системе")
+
+            with mock.patch.object(oc, "_PROTECTED_EXACT", {real}), \
+                    mock.patch.object(oc, "_PROTECTED_TREES", {real}), \
+                    mock.patch.object(oc, "_USER_TEMP_TREES", set()):
+                self.assertTrue(oc.is_protected_dir(link))
+                self.assertTrue(oc.is_protected_dir(real / "passwd"))
+                self.assertTrue(oc.is_protected_dir(real))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_macos_temp_inside_protected_var_is_allowed(self):
+        """macOS: /var/folders — пользовательский temp, хотя лежит в /private/var.
+
+        Без этого исключения tempfile.mkdtemp() на macOS считался бы защищённым
+        и органайзер не смог бы рассортировать временную папку.
+        """
+        from unittest import mock
+
+        import organizer_core as oc
+
+        fake_temp = Path("/private/var/folders/zz/T/tmp123")  # не создаём
+        with mock.patch.object(oc, "_PROTECTED_TREES", {Path("/private/var")}):
+            self.assertTrue(oc.is_protected_dir(Path("/private/var/log")))
+            self.assertFalse(oc.is_protected_dir(fake_temp))
+
+
 class TestMonitoring(unittest.TestCase):
     """Тесты мониторинга (H6) — настройки, старт/стоп без утечек."""
 
@@ -1321,10 +1891,15 @@ class TestCli(unittest.TestCase):
         (self.test_dir / "photo.jpg").write_text("jpg")
         (self.test_dir / "doc.pdf").write_text("pdf")
 
-    def _run(self, *args: str) -> "subprocess.CompletedProcess[str]":
+    def _run(
+        self, *args: str, env: "dict[str, str] | None" = None
+    ) -> "subprocess.CompletedProcess[str]":
+        """Запуск CLI. Вывод всегда читаем как UTF-8: на Windows труба по
+        умолчанию отдаёт cp1252, и русский текст иначе не декодируется."""
         return subprocess.run(
             [sys.executable, self.CLI, *args],
             capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace", env=env,
         )
 
     def test_cli_help(self):

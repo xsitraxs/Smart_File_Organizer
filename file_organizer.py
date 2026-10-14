@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from organizer_core import (
+    _harden_console_encoding,
     get_undo_count,
     load_config,
     load_config_from_path,
@@ -110,6 +111,9 @@ def resolve_path(path_str: str) -> Path:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    # Windows: перенаправленный вывод по умолчанию в cp1252 — русский текст
+    # в print() падал бы с UnicodeEncodeError. Настраиваем потоки заранее.
+    _harden_console_encoding()
     parser = create_parser()
     args = parser.parse_args(argv)
 
