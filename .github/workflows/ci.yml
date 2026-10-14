@@ -35,13 +35,38 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Tests without watchdog (polling fallback)
-        run: python -m unittest test_organizer_core -v
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest test_organizer_core -v 2>&1 | tee "${RUNNER_TEMP}/unittest.log"
 
       - name: Install watchdog (event-based monitoring)
         run: pip install "watchdog>=2.0"
 
       - name: Tests with watchdog
-        run: python -m pytest test_organizer_core.py -q
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest test_organizer_core.py -q 2>&1 | tee "${RUNNER_TEMP}/pytest.log"
+
+      # На Windows/macOS лог шага без этого пришлось бы искать глазами в вебе:
+      # выносим имена упавших тестов в аннотации (их видно через API и в UI).
+      - name: Опубликовать упавшие тесты
+        if: failure()
+        shell: bash
+        run: |
+          emit() {
+            while IFS= read -r line; do
+              echo "::error title=CI failure::${line}"
+            done
+          }
+          for log in "${RUNNER_TEMP}/unittest.log" "${RUNNER_TEMP}/pytest.log"; do
+            [ -f "$log" ] || continue
+            echo "--- ${log} ---"
+            grep -hE "^(FAIL|ERROR): |^FAILED " "$log" | sort -u | head -10 | emit
+            grep -hE "AssertionError|Error: " "$log" | sort -u | head -5 | emit
+          done
+          exit 0
 
   lint:
     name: Lint & types

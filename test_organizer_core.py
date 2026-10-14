@@ -508,6 +508,117 @@ class TestCaseInsensitiveDedup(unittest.TestCase):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
 
+class TestCaseInsensitiveBranchForced(unittest.TestCase):
+    """Ветки для регистронезависимых ФС (Windows/macOS) на Linux-ФС.
+
+    На регистрозависимой ФС эти пути кода не выполняются сами по себе,
+    поэтому флаг подставляется принудительно — иначе поведение на Windows
+    и macOS осталось бы непокрытым вплоть до CI на этих ОС.
+    """
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "images").mkdir()
+        (self.test_dir / "images" / "Photo.JPG").write_text("OLD")
+        (self.test_dir / "photo.jpg").write_text("NEW")
+
+    def _organize(self, strategy: str) -> dict:
+        from unittest import mock
+
+        import organizer_core as oc
+
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["duplicate_strategy"] = strategy
+        with mock.patch.object(oc, "_fs_is_case_insensitive", return_value=True):
+            return oc.organize_files(str(self.test_dir), verbose=False, config=cfg)
+
+    @staticmethod
+    def _category_files(directory: Path) -> "dict[str, str]":
+        return {
+            p.name: p.read_text()
+            for p in directory.iterdir()
+            if p.is_file()
+        }
+
+    def test_rename_strategy_keeps_both_files(self):
+        """Коллизия по регистру: оба файла сохранены, ни один не перезаписан."""
+        stats = self._organize("rename")
+        files = self._category_files(self.test_dir / "images")
+        self.assertEqual(stats["duplicates"], 1)
+        self.assertEqual(stats["errors"], 0)
+        self.assertIn("OLD", files.values())
+        self.assertIn("NEW", files.values())
+        self.assertEqual(len(files), 2)
+
+    def test_skip_strategy_keeps_existing_and_source(self):
+        """skip: новый файл не тронут, старый на месте."""
+        stats = self._organize("skip")
+        files = self._category_files(self.test_dir / "images")
+        self.assertEqual(stats["duplicates"], 1)
+        self.assertEqual(files, {"Photo.JPG": "OLD"})
+        self.assertTrue((self.test_dir / "photo.jpg").exists(), "файл потерян при skip")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestRealCaseInsensitiveFS(unittest.TestCase):
+    """Сценарии, которые требуют настоящей регистронезависимой ФС.
+
+    На Linux такой ФС нет, поэтому здесь проверяем себя честно: если ФС всё
+    же регистрозависимая — тест пропускается (на macOS/Windows CI он
+    выполняется реально). Подделывать флаг нельзя: на Linux «photo.jpg» и
+    «Photo.JPG» — разные файлы, и сценарий теряет смысл.
+    """
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "images").mkdir()
+        (self.test_dir / "images" / "Photo.JPG").write_text("OLD")
+
+    def _require_case_insensitive_fs(self) -> None:
+        from organizer_core import _fs_is_case_insensitive
+
+        if not _fs_is_case_insensitive(self.test_dir):
+            self.skipTest("ФС регистрозависимая (Linux) — сценарий macOS/Windows")
+
+    def test_replace_strategy_backs_up_case_collision(self):
+        """replace на CI-ФС: «photo.jpg» находит «Photo.JPG» и уводит его в .bak."""
+        self._require_case_insensitive_fs()
+        (self.test_dir / "photo.jpg").write_text("NEW")
+
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["duplicate_strategy"] = "replace"
+        stats = organize_files(str(self.test_dir), verbose=False, config=cfg)
+
+        self.assertEqual(stats["duplicates"], 1)
+        self.assertEqual(stats["errors"], 0)
+        files = self._category_files(self.test_dir / "images")
+        self.assertEqual(files.get("photo.jpg"), "NEW", "новый файл не занял имя")
+        backups = [text for name, text in files.items() if ".bak-" in name]
+        self.assertEqual(backups, ["OLD"], "заменённый файл не сохранён в бэкап")
+
+    def test_no_silent_overwrite_of_existing_name(self):
+        """Файл с тем же именем в другом регистре не перезаписывается молча."""
+        self._require_case_insensitive_fs()
+        (self.test_dir / "photo.jpg").write_text("NEW")
+
+        stats = organize_files(str(self.test_dir), verbose=False)
+
+        self.assertEqual(stats["duplicates"], 1)
+        files = self._category_files(self.test_dir / "images")
+        self.assertIn("OLD", files.values(), "старый файл потерян")
+        self.assertIn("NEW", files.values(), "новый файл потерян")
+        self.assertEqual(len(files), 2)
+
+    @staticmethod
+    def _category_files(directory: Path) -> "dict[str, str]":
+        return {p.name: p.read_text() for p in directory.iterdir() if p.is_file()}
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
 class TestCaseSensitivityProbe(unittest.TestCase):
     """Тест реальной проверки ФС на чувствительность к регистру (вместо догадки)."""
 
