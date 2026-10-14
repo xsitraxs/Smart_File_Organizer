@@ -1438,6 +1438,43 @@ class TestScriptFilesScope(unittest.TestCase):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
 
+class TestProgressReporting(unittest.TestCase):
+    """Тест M6: прогресс отражает реальные перемещения, а не только скан."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        for i in range(8):
+            (self.test_dir / f"f{i}.txt").write_text("x")
+
+    def test_progress_is_monotonic_and_reaches_100(self):
+        """Прогресс монотонен и доходит до 100% только после перемещений (M6)."""
+        events: list = []
+        organize_files(
+            str(self.test_dir),
+            verbose=False,
+            progress_callback=lambda c, t: events.append((c, t)),
+        )
+        self.assertTrue(events)
+        ratios = [c / t for c, t in events]
+        self.assertTrue(all(b >= a for a, b in zip(ratios, ratios[1:])), ratios)
+        self.assertEqual(ratios[-1], 1.0)
+
+    def test_progress_not_complete_before_moves(self):
+        """Прогресс не должен быть 100% на этапе фильтрации (M6)."""
+        events: list = []
+        organize_files(
+            str(self.test_dir),
+            verbose=False,
+            progress_callback=lambda c, t: events.append((c, t)),
+        )
+        # Первое событие — самое начало, задолго до 100%
+        first_ratio = events[0][0] / events[0][1]
+        self.assertLess(first_ratio, 0.5)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
 class TestScanErrors(unittest.TestCase):
     """Тест M8: недоступные подпапки учитываются в статистике."""
 

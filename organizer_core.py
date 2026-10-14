@@ -865,14 +865,18 @@ def _organize_files_impl(
     #    и использовать in-memory set для всех проверок коллизий
     # 3. Значительно сократить число mkdir/exists системных вызовов
 
-    # Сначала фильтруем и проверяем безопасность — строим батчи
+    # Сначала фильтруем и проверяем безопасность — строим батчи.
+    # M6 fix: фильтрация (быстрая фаза) занимает первую половину прогресса,
+    # перемещение файлов (реальная работа) — вторую. Раньше прогресс доходил
+    # до 100% ещё до первого перемещения.
     batches: defaultdict[str, list[tuple[Path, os.stat_result]]] = defaultdict(list)
+    progress_total = total * 2
     global_idx = 0
 
     for file_path, st in files_with_stat:
         global_idx += 1
         if progress_callback:
-            progress_callback(global_idx, total)
+            progress_callback(min(global_idx, total), progress_total)
 
         if not _validate_path_safety(file_path, source_path):
             log(f"  ✗  Пропущен небезопасный путь: {file_path.name}")
@@ -891,6 +895,15 @@ def _organize_files_impl(
     # read-modify-write всего файла на каждую запись.
     undo_writer = _UndoLogWriter(_undo_log_path(source_path)) if not use_dry_run else None
 
+    # M6 fix: вторая половина прогресса — по факту обработки файлов
+    handled = 0
+
+    def _report_move_progress() -> None:
+        nonlocal handled
+        handled += 1
+        if progress_callback:
+            progress_callback(min(total + handled, progress_total), progress_total)
+
     # Обрабатываем каждую категорию одним блоком
     for category, batch in batches.items():
         target_cat_dir = source_path / category
@@ -902,6 +915,7 @@ def _organize_files_impl(
                 log(f"  → {masked}  ➜  {category}/")
                 stats["moved"] += 1
                 stats["by_category"][category] += 1
+                _report_move_progress()
             continue
 
         # mkdir один раз на категорию
@@ -950,6 +964,7 @@ def _organize_files_impl(
                             log(f"  ⏭  Пропущен (уже есть): {masked}")
                             stats["skipped"] += 1
                             stats["duplicates"] += 1
+                            _report_move_progress()
                             continue
                         elif dup_strategy == "replace":
                             # H2 fix: заменяемый файл переносится в бэкап (rename-aside),
@@ -996,6 +1011,7 @@ def _organize_files_impl(
                             except Exception as exc:
                                 log(f"  ✗  Ошибка создания бэкапа для замены: {exc}")
                                 stats["errors"] += 1
+                                _report_move_progress()
                                 continue
                         else:  # rename (default) — передаём уже готовый set
                             target_path = _get_unique_path(
@@ -1042,11 +1058,13 @@ def _organize_files_impl(
 
                     stats["moved"] += 1
                     stats["by_category"][category] += 1
+                    _report_move_progress()
 
                 except Exception as exc:
                     masked = _mask_path_for_log(file_path, source_path)
                     log(f"  ✗  Ошибка: {masked} — {exc}")
                     stats["errors"] += 1
+                    _report_move_progress()
 
     # _UndoLogWriter синхронный — отдельный flush не нужен.
     # Синхронизируем in-memory лог сессии (оставлен для совместимости с тестами).
