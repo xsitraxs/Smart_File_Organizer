@@ -1808,19 +1808,37 @@ class TestDirLocks(unittest.TestCase):
         self.assertEqual(len(oc._dir_locks), 0)
 
     def test_same_dir_is_not_sorted_twice_in_parallel(self):
-        """Защита от параллельной сортировки одной папки сохраняется."""
+        """Защита от параллельной сортировки одной папки сохраняется.
+
+        Тест детерминированный: потоки стартуют одновременно (Barrier), а
+        перемещение искусственно замедлено — иначе на быстрой машине первый
+        поток успевал бы закончить, и «конкурентов» просто не оставалось
+        (flake на медленном раннере: ровно этот сценарий ловил CI).
+        """
+        from unittest import mock
+
+        import organizer_core as oc
+
         results: list = []
         test_dir = Path(tempfile.mkdtemp())
-        (test_dir / "a.txt").write_text("x")
+        (test_dir / "a.txt").write_text("x", encoding="utf-8")
+        barrier = threading.Barrier(4)
+        real_move = shutil.move
+
+        def slow_move(*args: Any, **kwargs: Any) -> Any:
+            time.sleep(0.5)  # лок держится заведомо дольше, чем стартуют потоки
+            return real_move(*args, **kwargs)
 
         def worker() -> None:
+            barrier.wait(timeout=30)
             results.append(organize_files(str(test_dir), verbose=False))
 
-        threads = [threading.Thread(target=worker) for _ in range(4)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=30)
+        with mock.patch.object(oc.shutil, "move", side_effect=slow_move):
+            threads = [threading.Thread(target=worker) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
 
         self.assertEqual(len(results), 4)
         self.assertEqual(sum(1 for r in results if r.get("skipped_concurrent")), 3)
