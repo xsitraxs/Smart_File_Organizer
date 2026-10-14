@@ -8,12 +8,18 @@ on:
 
 jobs:
   test:
-    name: Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.9", "3.11", "3.12"]
+        exclude:
+          # На macOS-раннерах (Apple Silicon) сборок Python 3.9 нет —
+          # 3.9 покрыт на Linux и Windows, здесь проверяем актуальные версии.
+          - os: macos-latest
+            python-version: "3.9"
 
     steps:
       - uses: actions/checkout@v4
@@ -29,13 +35,51 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Tests without watchdog (polling fallback)
-        run: python -m unittest test_organizer_core -v
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest test_organizer_core -v 2>&1 | tee "${RUNNER_TEMP}/unittest.log"
 
       - name: Install watchdog (event-based monitoring)
         run: pip install "watchdog>=2.0"
 
       - name: Tests with watchdog
-        run: python -m pytest test_organizer_core.py -q
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest test_organizer_core.py -q 2>&1 | tee "${RUNNER_TEMP}/pytest.log"
+
+      # На Windows/macOS лог шага без этого пришлось бы искать глазами в вебе:
+      # выносим имена упавших тестов в аннотации (их видно через API и в UI).
+      # Имена упавших тестов выносим в аннотации (иначе на чужой ОС пришлось
+      # бы искать их глазами), а итог прогона — в notice: видно, что именно
+      # выполнялось и что было пропущено платформенными skip'ами.
+      - name: Итог тестов в аннотациях
+        if: always()
+        shell: bash
+        # GitHub запускает bash с -e -o pipefail: grep без совпадений вернул бы
+        # единицу и уронил бы шаг, поэтому глушим строгий режим.
+        run: |
+          set +e +o pipefail
+          emit() {
+            while IFS= read -r line; do
+              echo "::error title=CI failure::${line}"
+            done
+          }
+          notice() {
+            while IFS= read -r line; do
+              echo "::notice title=${{ matrix.os }} py${{ matrix.python-version }}::${line}"
+            done
+          }
+          for log in "${RUNNER_TEMP}/unittest.log" "${RUNNER_TEMP}/pytest.log"; do
+            [ -f "$log" ] || continue
+            echo "--- ${log} ---"
+            { grep -hE "^(FAIL|ERROR): |^FAILED " "$log" || true; } | sort -u | head -10 | emit
+            { grep -hE "AssertionError|Error: " "$log" || true; } | sort -u | head -5 | emit
+            { grep -hE "^(Ran [0-9]+ tests|OK|FAILED|[0-9]+ (passed|failed))" "$log" || true; } \
+              | sort -u | head -3 | notice
+          done
+          exit 0
 
   lint:
     name: Lint & types
