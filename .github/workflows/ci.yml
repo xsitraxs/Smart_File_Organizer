@@ -51,8 +51,11 @@ jobs:
 
       # На Windows/macOS лог шага без этого пришлось бы искать глазами в вебе:
       # выносим имена упавших тестов в аннотации (их видно через API и в UI).
-      - name: Опубликовать упавшие тесты
-        if: failure()
+      # Имена упавших тестов выносим в аннотации (иначе на чужой ОС пришлось
+      # бы искать их глазами), а итог прогона — в notice: видно, что именно
+      # выполнялось и что было пропущено платформенными skip'ами.
+      - name: Итог тестов в аннотациях
+        if: always()
         shell: bash
         run: |
           emit() {
@@ -60,11 +63,17 @@ jobs:
               echo "::error title=CI failure::${line}"
             done
           }
+          notice() {
+            while IFS= read -r line; do
+              echo "::notice title=${{ matrix.os }} py${{ matrix.python-version }}::${line}"
+            done
+          }
           for log in "${RUNNER_TEMP}/unittest.log" "${RUNNER_TEMP}/pytest.log"; do
             [ -f "$log" ] || continue
             echo "--- ${log} ---"
             grep -hE "^(FAIL|ERROR): |^FAILED " "$log" | sort -u | head -10 | emit
             grep -hE "AssertionError|Error: " "$log" | sort -u | head -5 | emit
+            grep -hE "^(Ran [0-9]+ tests|OK|FAILED|[0-9]+ (passed|failed))" "$log" | sort -u | head -3 | notice
           done
           exit 0
 

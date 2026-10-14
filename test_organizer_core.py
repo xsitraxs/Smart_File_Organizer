@@ -598,6 +598,22 @@ class TestRealCaseInsensitiveFS(unittest.TestCase):
         backups = [text for name, text in files.items() if ".bak-" in name]
         self.assertEqual(backups, ["OLD"], "заменённый файл не сохранён в бэкап")
 
+    def test_platform_default_fs_is_case_insensitive(self):
+        """На Windows/macOS ФС по умолчанию нечувствительна к регистру.
+
+        Это гарантия, что сценарии этого класса на CI действительно
+        выполняются, а не пропускаются молча — иначе платформенные ветки
+        остались бы непроверенными.
+        """
+        if os.name != "nt" and sys.platform != "darwin":
+            self.skipTest("проверка имеет смысл только для Windows/macOS")
+        from organizer_core import _fs_is_case_insensitive
+
+        self.assertTrue(
+            _fs_is_case_insensitive(self.test_dir),
+            "ожидалась регистронезависимая ФС (APFS/NTFS по умолчанию)",
+        )
+
     def test_no_silent_overwrite_of_existing_name(self):
         """Файл с тем же именем в другом регистре не перезаписывается молча."""
         self._require_case_insensitive_fs()
