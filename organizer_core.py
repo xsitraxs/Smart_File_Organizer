@@ -1292,6 +1292,12 @@ def _organize_files_impl(
         target_cat_dir = source_path / category
         stats["by_category"].setdefault(category, 0)
 
+        # os.scandir отдаёт файлы в порядке файловой системы, а от порядка зависит
+        # результат: какой из одинаковых файлов останется на месте (дубликаты по
+        # содержимому) и кто получит суффикс _1 при коллизии имён. Сортируем,
+        # чтобы поведение было предсказуемым и одинаковым между запусками.
+        batch.sort(key=lambda item: str(item[0]))
+
         if use_dry_run:
             for file_path, _ in batch:
                 masked = _mask_path_for_log(file_path, source_path)

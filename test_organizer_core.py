@@ -1201,7 +1201,11 @@ class TestContentDuplicates(unittest.TestCase):
         self.assertEqual([p.name for p in (self.test_dir / "images").iterdir()], ["a.jpg"])
 
     def test_duplicates_inside_one_batch(self):
-        """Дубликат ловится и внутри одной партии (первый уже перемещён)."""
+        """Дубликат ловится и внутри одной партии (первый уже перемещён).
+
+        Порядок обработки детерминированный (сортировка по пути), поэтому
+        первым уезжает a.jpg, а не случайный файл из os.scandir.
+        """
         for name in ("a.jpg", "b.jpg", "c.jpg"):
             self._write(name, b"triple")
 
@@ -1210,6 +1214,7 @@ class TestContentDuplicates(unittest.TestCase):
         self.assertEqual(stats["moved"], 1)
         self.assertEqual(stats["content_duplicates"], 2)
         self.assertEqual(self._root_files(), ["b.jpg", "c.jpg"])
+        self.assertEqual([p.name for p in (self.test_dir / "images").iterdir()], ["a.jpg"])
 
     def test_same_size_different_content_is_not_duplicate(self):
         """Одинаковый размер при разном содержимом — не дубликат."""
