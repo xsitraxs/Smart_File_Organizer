@@ -1,4 +1,3 @@
-```
 # Python
 __pycache__/
 *.pyc
@@ -16,10 +15,12 @@ pip-log.txt
 pip-selfcheck.json
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
 .tox/
+.nox/
 
 # Build artifacts
 build/
@@ -37,6 +38,11 @@ dist/
 .env.local
 .env.*
 
+# Organizer runtime artifacts
+# Журнал отмены создаётся в целевых папках пользователя — в репозиторий не нужен
+.organizer_undo.json
+.organizer_undo.json.tmp.*
+
 # Editors
 .vscode/
 .idea/
@@ -47,4 +53,3 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
-```
