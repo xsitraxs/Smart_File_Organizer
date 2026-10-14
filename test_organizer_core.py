@@ -1399,6 +1399,34 @@ class TestContentDuplicatesCli(unittest.TestCase):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
 
+class TestSuiteIsLocaleIndependent(unittest.TestCase):
+    """
+    Текстовые файлы в тестах пишем/читаем с явной кодировкой.
+
+    Без неё используется локальная кодировка: на Windows это cp1252, где нет
+    кириллицы, и тест падает с UnicodeEncodeError (ровно это поймал CI на
+    Windows-раннере). Проверяем статически, чтобы ошибка была видна на любой
+    платформе, а не только на Windows.
+    """
+
+    def test_non_ascii_text_calls_have_explicit_encoding(self):
+        import ast
+
+        src = Path(__file__).read_text(encoding="utf-8")
+        offenders = []
+        for node in ast.walk(ast.parse(src)):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr not in ("write_text", "read_text"):
+                continue
+            if any(kw.arg == "encoding" for kw in node.keywords):
+                continue
+            literal = ast.get_source_segment(src, node.args[0]) if node.args else ""
+            if literal and any(ord(ch) > 127 for ch in literal):
+                offenders.append(f"строка {node.lineno}: {literal[:40]!r}")
+        self.assertEqual(offenders, [], "текст без явной кодировки: " + "; ".join(offenders))
+
+
 class TestJournalCompaction(unittest.TestCase):
     """Тесты ограничения журнала отмены (settings.max_undo_entries)."""
 
@@ -1636,14 +1664,16 @@ class TestBackupCleanup(unittest.TestCase):
         from organizer_core import _cleanup_old_backups
 
         weird = [
-            self.test_dir / "images" / "photo.jpg.bak-недата",
+            self.test_dir / "images" / "photo.jpg.bak-недата",  # имя, не содержимое
             self.test_dir / "images" / "photo.jpg.bak",
             self.test_dir / "images" / "backup.jpg",
             self.test_dir / "images" / "photo.jpg.bak-00000000_000000",
             self.test_dir / "images" / "photo.jpg.bak-20260101_1200",
         ]
         for path in weird:
-            path.write_text("не бэкап")
+            # Явная кодировка обязательна: на Windows (cp1252) write_text без неё
+            # падает на кириллице — тест проверял бы не уборку, а локаль.
+            path.write_text("not a backup", encoding="utf-8")
 
         removed = _cleanup_old_backups(self.test_dir, {"images"}, 1, False, lambda msg: None)
 
@@ -1799,15 +1829,16 @@ class TestDirLocks(unittest.TestCase):
         """Запись удаляется последним пользователем, а не первым."""
         import organizer_core as oc
 
-        entry = oc._get_dir_lock("/tmp/example")
-        second = oc._get_dir_lock("/tmp/example")
+        key = str(Path(tempfile.mkdtemp()))
+        entry = oc._get_dir_lock(key)
+        second = oc._get_dir_lock(key)
         self.assertIs(entry, second)
 
-        oc._release_dir_lock("/tmp/example", entry)
-        self.assertIn("/tmp/example", oc._dir_locks, "запись удалена при живом пользователе")
+        oc._release_dir_lock(key, entry)
+        self.assertIn(key, oc._dir_locks, "запись удалена при живом пользователе")
 
-        oc._release_dir_lock("/tmp/example", second)
-        self.assertNotIn("/tmp/example", oc._dir_locks)
+        oc._release_dir_lock(key, second)
+        self.assertNotIn(key, oc._dir_locks)
 
 
 class TestConcurrentOrganize(unittest.TestCase):
