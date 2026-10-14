@@ -20,6 +20,7 @@
     "ignore_hidden":      true,
     "log_file":           "actions.log",
     "duplicate_strategy": "rename",
-    "use_watchdog":       true
+    "use_watchdog":       true,
+    "content_duplicates": false
   }
 }

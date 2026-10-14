@@ -64,6 +64,11 @@ def create_parser() -> argparse.ArgumentParser:
         help="Не рекурсивно: обрабатывать только файлы в корне папки",
     )
     parser.add_argument(
+        "--content-duplicates",
+        action="store_true",
+        help="Не переносить файлы, содержимое которых (SHA-256) уже есть в категории",
+    )
+    parser.add_argument(
         "--undo",
         action="store_true",
         help="Отменить последнюю операцию сортировки",
@@ -135,6 +140,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"Ошибка: {e}", file=sys.stderr)
         return 1
 
+    if args.content_duplicates:
+        # CLI-флаг имеет приоритет над конфигом
+        config.setdefault("settings", {})["content_duplicates"] = True
+
     # Handle mutually exclusive operations
     operations = sum([
         args.undo,
@@ -203,6 +212,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"\nПеремещено: {stats['moved']}")
             print(f"Пропущено: {stats['skipped']}")
             print(f"Дубликатов: {stats['duplicates']}")
+            if stats.get('content_duplicates'):
+                print(f"Дубликатов по содержимому: {stats['content_duplicates']}")
             print(f"Ошибок: {stats['errors']}")
             if stats.get('empty_dirs_removed'):
                 print(f"Пустых папок удалено: {stats['empty_dirs_removed']}")

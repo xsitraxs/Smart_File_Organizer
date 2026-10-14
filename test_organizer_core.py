@@ -24,6 +24,7 @@ from typing import Any
 
 from organizer_core import (
     DEFAULT_CONFIG,
+    PARTIAL_HASH_BYTES,
     UNDO_LOG_FILENAME,
     _build_ext_map,
     _get_category,
@@ -1131,6 +1132,253 @@ class TestPortableJournalPaths(unittest.TestCase):
         self.assertEqual(stats["errors"], 0)
         self.assertTrue((self.test_dir / "a.txt").exists())
         self.assertTrue((self.test_dir / "sub" / "b.pdf").exists())
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestContentDuplicates(unittest.TestCase):
+    """Тесты поиска дубликатов по содержимому (settings.content_duplicates).
+
+    Сравнение двухступенчатое: размер + SHA-256 первых 64 КБ, и только при
+    совпадении — полный SHA-256. Поэтому отдельно проверяем и «ложное»
+    совпадение префикса, и настоящий дубликат длиннее 64 КБ.
+    """
+
+    CHUNK = 100_000  # больше PARTIAL_HASH_BYTES (64 КБ)
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def _write(self, name: str, data: bytes) -> Path:
+        path = self.test_dir / name
+        path.write_bytes(data)
+        return path
+
+    def _config(self, enabled: bool = True) -> dict:
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["content_duplicates"] = enabled
+        return cfg
+
+    def _organize(self, enabled: bool = True) -> dict:
+        return organize_files(str(self.test_dir), verbose=False, config=self._config(enabled))
+
+    def _root_files(self) -> "list[str]":
+        return sorted(
+            p.name for p in self.test_dir.iterdir()
+            if p.is_file() and p.name != UNDO_LOG_FILENAME
+        )
+
+    def test_option_is_off_by_default(self):
+        """По умолчанию содержимое не сравнивается — поведение как раньше."""
+        self.assertFalse(DEFAULT_CONFIG["settings"]["content_duplicates"])
+        self._write("a.jpg", b"identical")
+        self._write("b.jpg", b"identical")
+
+        stats = self._organize(enabled=False)
+
+        self.assertEqual(stats["moved"], 2)
+        self.assertEqual(stats["content_duplicates"], 0)
+        self.assertEqual(self._root_files(), [])
+
+    def test_stats_always_contain_content_duplicates(self):
+        """Ключ статистики есть всегда — на него могут смотреть потребители."""
+        self._write("a.jpg", b"x")
+        stats = self._organize(enabled=False)
+        self.assertIn("content_duplicates", stats)
+
+    def test_identical_content_is_not_moved_twice(self):
+        """Файл с уже имеющимся содержимым остаётся на месте."""
+        self._write("a.jpg", b"same-bytes")
+        self._write("b.jpg", b"same-bytes")
+
+        stats = self._organize()
+
+        self.assertEqual(stats["content_duplicates"], 1)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["moved"], 1)
+        self.assertEqual(self._root_files(), ["b.jpg"])
+        self.assertEqual([p.name for p in (self.test_dir / "images").iterdir()], ["a.jpg"])
+
+    def test_duplicates_inside_one_batch(self):
+        """Дубликат ловится и внутри одной партии (первый уже перемещён)."""
+        for name in ("a.jpg", "b.jpg", "c.jpg"):
+            self._write(name, b"triple")
+
+        stats = self._organize()
+
+        self.assertEqual(stats["moved"], 1)
+        self.assertEqual(stats["content_duplicates"], 2)
+        self.assertEqual(self._root_files(), ["b.jpg", "c.jpg"])
+
+    def test_same_size_different_content_is_not_duplicate(self):
+        """Одинаковый размер при разном содержимом — не дубликат."""
+        self._write("a.jpg", b"A" * 5000)
+        self._write("b.jpg", b"B" * 5000)
+
+        stats = self._organize()
+
+        self.assertEqual(stats["content_duplicates"], 0)
+        self.assertEqual(stats["moved"], 2)
+
+    def test_prefix_collision_requires_full_hash(self):
+        """Совпадение первых 64 КБ без совпадения всего файла — не дубликат."""
+        head = b"H" * PARTIAL_HASH_BYTES
+        self._write("a.jpg", head + b"tail-1" * 100)
+        self._write("b.jpg", head + b"tail-2" * 100)
+
+        stats = self._organize()
+
+        self.assertEqual(stats["content_duplicates"], 0, "префикс совпал, содержимое — нет")
+        self.assertEqual(stats["moved"], 2)
+
+    def test_identical_files_larger_than_prefix_are_duplicates(self):
+        """Полностью идентичные файлы длиннее 64 КБ распознаются (полный хэш)."""
+        data = b"F" * self.CHUNK
+        self._write("a.mp3", data)
+        self._write("b.mp3", data)
+
+        stats = self._organize()
+
+        self.assertEqual(stats["content_duplicates"], 1)
+        self.assertEqual(stats["moved"], 1)
+
+    def test_same_name_and_content_is_skipped_not_renamed(self):
+        """Одинаковое имя и содержимое: не создаём копию с суффиксом."""
+        (self.test_dir / "images").mkdir()
+        (self.test_dir / "images" / "photo.jpg").write_bytes(b"same")
+        self._write("photo.jpg", b"same")
+
+        stats = self._organize()
+
+        self.assertEqual(stats["content_duplicates"], 1)
+        self.assertEqual([p.name for p in (self.test_dir / "images").iterdir()], ["photo.jpg"])
+        self.assertEqual(stats["duplicates"], 0, "это не коллизия имён")
+
+    def test_index_never_matches_the_file_itself(self):
+        """Индекс не считает файл дубликатом самого себя."""
+        from organizer_core import _ContentIndex
+
+        path = self._write("a.jpg", b"self")
+        index = _ContentIndex(self.test_dir)
+        self.assertIsNone(index.find_identical(path, path.stat().st_size))
+
+    def test_missing_file_returns_no_hash(self):
+        """Хэш недоступного файла — None (а не исключение)."""
+        from organizer_core import _hash_full, _hash_prefix
+
+        missing = self.test_dir / "none.bin"
+        self.assertIsNone(_hash_prefix(missing, 10))
+        self.assertIsNone(_hash_full(missing))
+
+    def test_prefix_hash_matches_manual_slice(self):
+        """Хэш префикса равен SHA-256 первых PARTIAL_HASH_BYTES байт."""
+        import hashlib as _hashlib
+
+        from organizer_core import _hash_prefix
+
+        data = os.urandom(self.CHUNK)
+        path = self._write("big.bin", data)
+        expected = _hashlib.sha256(data[:PARTIAL_HASH_BYTES]).hexdigest()
+        self.assertEqual(_hash_prefix(path, len(data)), expected)
+
+    @unittest.skipIf(os.name == "nt", "нужны права POSIX")
+    def test_unreadable_file_does_not_break_sorting(self):
+        """Нечитаемый файл не ломает сортировку (хэш просто не считается)."""
+        if os.geteuid() == 0:  # pragma: no cover - root читает всё
+            self.skipTest("тест не работает под root")
+        locked = self._write("locked.jpg", b"locked-bytes")
+        locked.chmod(0o000)
+        try:
+            self._write("other.jpg", b"other-bytes")
+            stats = self._organize()
+            self.assertEqual(stats["errors"], 0)
+            self.assertEqual(stats["moved"], 2)
+            self.assertEqual(stats["content_duplicates"], 0)
+            # Файл без прав на чтение всё равно уехал в категорию
+            self.assertTrue((self.test_dir / "images" / "locked.jpg").exists())
+        finally:
+            # Файл мог быть перемещён — права возвращаем там, где он оказался
+            import contextlib
+
+            for path in (locked, self.test_dir / "images" / "locked.jpg"):
+                with contextlib.suppress(FileNotFoundError):
+                    path.chmod(0o644)
+
+    def test_dry_run_does_not_read_files(self):
+        """В dry-run план строится без чтения содержимого."""
+        self._write("a.jpg", b"same")
+        self._write("b.jpg", b"same")
+
+        stats = organize_files(str(self.test_dir), dry_run=True, verbose=False,
+                               config=self._config())
+
+        self.assertEqual(stats["content_duplicates"], 0)
+        self.assertEqual(stats["moved"], 2)
+        self.assertEqual(self._root_files(), ["a.jpg", "b.jpg"])
+
+    def test_undo_restores_only_moved_files(self):
+        """Пропущенный дубликат не попадает в журнал и остаётся на месте."""
+        self._write("a.jpg", b"same")
+        self._write("b.jpg", b"same")
+        self._organize()
+
+        stats = undo_last_operation(str(self.test_dir), verbose=False)
+
+        self.assertEqual(stats["restored"], 1)
+        self.assertEqual(self._root_files(), ["a.jpg", "b.jpg"])
+
+    def test_schema_rejects_non_bool(self):
+        """Неверный тип content_duplicates отклоняется валидацией конфига."""
+        from organizer_core import _validate_config_schema
+
+        cfg = {
+            "categories": {"images": ["jpg"]},
+            "settings": {"content_duplicates": "yes"},
+        }
+        self.assertFalse(_validate_config_schema(cfg))
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+
+class TestContentDuplicatesCli(unittest.TestCase):
+    """Флаг --content-duplicates у CLI."""
+
+    CLI = str(Path(__file__).parent / "file_organizer.py")
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        (self.test_dir / "a.jpg").write_bytes(b"cli-identical")
+        (self.test_dir / "b.jpg").write_bytes(b"cli-identical")
+
+    def _run(self, *args: str) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(
+            [sys.executable, self.CLI, *args],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace",
+        )
+
+    def test_flag_enables_content_check(self):
+        """С флагом второй идентичный файл не переносится."""
+        r = self._run(str(self.test_dir), "--content-duplicates")
+
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue((self.test_dir / "b.jpg").exists(), "дубликат всё-таки перенесён")
+        self.assertIn("Дубликатов по содержимому: 1", r.stdout)
+
+    def test_without_flag_behaviour_is_unchanged(self):
+        """Без флага оба файла переносятся как раньше."""
+        r = self._run(str(self.test_dir))
+
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse((self.test_dir / "b.jpg").exists())
+        self.assertNotIn("Дубликатов по содержимому", r.stdout)
+
+    def test_help_mentions_flag(self):
+        """Флаг описан в --help."""
+        r = self._run("--help")
+        self.assertIn("--content-duplicates", r.stdout)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
