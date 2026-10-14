@@ -21,6 +21,8 @@
     "log_file":           "actions.log",
     "duplicate_strategy": "rename",
     "use_watchdog":       true,
-    "content_duplicates": false
+    "content_duplicates": false,
+    "max_undo_entries":   1000,
+    "backup_retention_days": 0
   }
 }

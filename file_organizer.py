@@ -69,6 +69,12 @@ def create_parser() -> argparse.ArgumentParser:
         help="Не переносить файлы, содержимое которых (SHA-256) уже есть в категории",
     )
     parser.add_argument(
+        "--backup-retention-days",
+        type=int,
+        metavar="DAYS",
+        help="Удалять бэкапы заменённых файлов старше DAYS дней (0 = хранить всегда)",
+    )
+    parser.add_argument(
         "--undo",
         action="store_true",
         help="Отменить последнюю операцию сортировки",
@@ -143,6 +149,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.content_duplicates:
         # CLI-флаг имеет приоритет над конфигом
         config.setdefault("settings", {})["content_duplicates"] = True
+    if args.backup_retention_days is not None:
+        config.setdefault("settings", {})["backup_retention_days"] = max(
+            0, args.backup_retention_days
+        )
 
     # Handle mutually exclusive operations
     operations = sum([
@@ -214,6 +224,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"Дубликатов: {stats['duplicates']}")
             if stats.get('content_duplicates'):
                 print(f"Дубликатов по содержимому: {stats['content_duplicates']}")
+            if stats.get('backups_removed'):
+                print(f"Удалено старых бэкапов: {stats['backups_removed']}")
             print(f"Ошибок: {stats['errors']}")
             if stats.get('empty_dirs_removed'):
                 print(f"Пустых папок удалено: {stats['empty_dirs_removed']}")

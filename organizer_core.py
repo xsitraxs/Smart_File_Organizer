@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import hashlib
+import io
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ import threading
 import time
 import unicodedata
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -194,6 +195,23 @@ PROTECTED_ABS_PATHS: list[Path] = [Path(p) for p in _PROTECTED_EXACT_PATHS]
 MAX_UNIQUE_PATH_ATTEMPTS = 1000  # Защита от DoS
 MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1 GB лимит размера файла
 
+# Журнал отмены. Без ограничения он растёт бесконечно: каждая сортировка
+# дописывает строки. По умолчанию храним последние DEFAULT_MAX_UNDO_ENTRIES
+# записей (0 = без ограничения).
+DEFAULT_MAX_UNDO_ENTRIES = 1000
+# fsync делаем не на каждую запись (это дорого), а пачками: данные переживают
+# падение процесса сразу (flush), потерю питания — по мере fsync.
+JOURNAL_FSYNC_INTERVAL = 50
+# Оценка размера одной JSON-записи — чтобы замечать разросшийся журнал, не
+# читая его на каждой записи.
+JOURNAL_BYTES_PER_ENTRY_HINT = 256
+
+# Сколько дней хранить бэкапы заменённых файлов (0 = хранить всегда).
+DEFAULT_BACKUP_RETENTION_DAYS = 0
+# Чистим только строго узнаваемые имена: <оригинал>.bak-ГГГГММДД_ЧЧММСС
+_BACKUP_NAME_RE = re.compile(r"\.bak-(\d{8}_\d{6})$")
+
+
 # Дубликаты по содержимому (опция settings.content_duplicates).
 # Сравнивать файлы целиком дорого, поэтому сначала сверяем размер и хэш первых
 # PARTIAL_HASH_BYTES байт, а полный SHA-256 считаем только при совпадении
@@ -227,6 +245,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "script_files":       list(DEFAULT_SCRIPT_FILES),  # Настраиваемые имена
         "max_file_size":      MAX_FILE_SIZE,  # Лимит размера файла
         "content_duplicates": False,  # Не переносить файлы с уже имеющимся содержимым
+        "max_undo_entries":   DEFAULT_MAX_UNDO_ENTRIES,  # 0 = журнал без ограничения
+        "backup_retention_days": DEFAULT_BACKUP_RETENTION_DAYS,  # 0 = хранить бэкапы всегда
     },
 }
 
@@ -238,18 +258,46 @@ _lock = threading.Lock()
 # молча блокировала сортировку любой другой папки в том же процессе — теперь
 # параллельная работа с разными папками разрешена, а повторный вход в ту же
 # папку по-прежнему пропускается (защита от гонок watchdog/monitoring).
-_dir_locks: dict[str, threading.Lock] = {}
+class _DirLock:
+    """Лок каталога и число потоков, которые держат на него ссылку."""
+
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.users = 0
+
+
+_dir_locks: dict[str, _DirLock] = {}
 _dir_locks_guard = threading.Lock()
 
 
-def _get_dir_lock(key: str) -> threading.Lock:
+def _get_dir_lock(key: str) -> _DirLock:
     """Возвращает (создавая при необходимости) лок для конкретной директории."""
     with _dir_locks_guard:
-        lock = _dir_locks.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _dir_locks[key] = lock
-        return lock
+        entry = _dir_locks.get(key)
+        if entry is None:
+            entry = _DirLock()
+            _dir_locks[key] = entry
+        entry.users += 1
+        return entry
+
+
+def _release_dir_lock(key: str, entry: _DirLock) -> None:
+    """
+    Отпускает ссылку на лок каталога и удаляет запись, когда она не нужна.
+
+    Раньше словарь _dir_locks рос бесконечно: каждое уникальное имя папки —
+    а при мониторинге папки загрузок это ещё и временные имена файлов —
+    навсегда оставляло в нём лок. Счётчик ссылок гарантирует, что запись
+    удаляется только тогда, когда её никто не держит и не ждёт: иначе два
+    потока могли бы получить разные лок-объекты для одной папки и сортировать
+    её одновременно.
+    """
+    with _dir_locks_guard:
+        entry.users -= 1
+        if entry.users <= 0 and _dir_locks.get(key) is entry:
+            del _dir_locks[key]
 
 
 # DEPRECATED: in-memory лог сессии оставлен только для обратной совместимости.
@@ -352,6 +400,12 @@ def _validate_config_schema(config: Any) -> bool:
     if max_size is not None and (not isinstance(max_size, int) or max_size <= 0):
         logger.warning("config.json: max_file_size должно быть положительным целым числом")
         return False
+    # Валидация размера журнала и срока хранения бэкапов (0 — «без ограничения»)
+    for key in ("max_undo_entries", "backup_retention_days"):
+        value = s.get(key)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+            logger.warning(f"config.json: {key} должно быть целым числом >= 0")
+            return False
     return True
 
 
@@ -964,20 +1018,108 @@ class _UndoLogWriter:
     - Не требует фонового потока — нет утечки потоков в режиме мониторинга.
     - Делает запись потокобезопасной без сложных гонок с undo_last_operation.
     - Сохраняет частичный прогресс на диск даже при прерывании (Ctrl+C).
+
+    Долговечность и размер:
+    - запись идёт в постоянный дескриптор (одно открытие на прогон);
+    - flush после каждой записи — данные уходят в ОС и переживают падение
+      процесса, а не только чистый выход;
+    - fsync пачками (JOURNAL_FSYNC_INTERVAL) и при close() — журнал переживает
+      потерю питания, при этом мы не платим fsync за каждый файл;
+    - при превышении лимита записей журнал компактизируется: остаются самые
+      свежие (см. settings.max_undo_entries).
     """
 
-    def __init__(self, log_path: Path) -> None:
+    def __init__(self, log_path: Path, max_entries: int = 0) -> None:
         self._path = log_path
+        self._max_entries = max(0, int(max_entries))
         self._lock = threading.Lock()
+        self._handle: Optional[io.BufferedWriter] = None
+        self._appends = 0
+        self._since_fsync = 0
+        self.trimmed = 0  # сколько старых записей выбросила компактизация
 
+    # ── внутреннее ────────────────────────────────────────────────────────────
+    def _open(self) -> io.BufferedWriter:
+        # Дескриптор держим намеренно: закрывается через close() (в конце
+        # сортировки), а не сразу — иначе flush/fsync на каждую запись требовал
+        # бы открывать файл заново.
+        if self._handle is None:
+            self._handle = open(self._path, "ab")  # noqa: SIM115
+        return self._handle
+
+    def _close_handle(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            with contextlib.suppress(OSError):
+                handle.close()
+
+    def _maybe_compact(self) -> None:
+        """Держит журнал в пределах max_undo_entries (0 = без ограничения)."""
+        if self._max_entries <= 0:
+            return
+        threshold = max(1, self._max_entries // 2)
+        needed = self._appends >= threshold
+        if not needed:
+            # Файл мог быть большим ещё до нас (лимит уменьшили в конфиге):
+            # размер проверяем дешевле, чем число записей.
+            try:
+                needed = self._path.stat().st_size > (
+                    self._max_entries * JOURNAL_BYTES_PER_ENTRY_HINT
+                )
+            except OSError:
+                return
+        if not needed:
+            return
+
+        self._close_handle()
+        entries = _read_undo_log_file(self._path)
+        self._appends = 0
+        if len(entries) <= self._max_entries:
+            return
+        dropped = len(entries) - self._max_entries
+        _write_undo_log_file(self._path, entries[-self._max_entries :])
+        self.trimmed += dropped
+        logger.info(
+            f"undo-журнал: удалены самые старые записи ({dropped}) — "
+            f"храним последние {self._max_entries}"
+        )
+
+    # ── публичное ─────────────────────────────────────────────────────────────
     def append(self, entry: dict) -> None:
         """Потокобезопасный append одной записи."""
         with self._lock:
             try:
-                with open(self._path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                data = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
+                handle = self._open()
+                handle.write(data)
+                handle.flush()
             except OSError as exc:
                 logger.warning(f"Не удалось записать в undo-лог: {exc}")
+                self._close_handle()
+                return
+
+            self._appends += 1
+            self._since_fsync += 1
+            if self._since_fsync >= JOURNAL_FSYNC_INTERVAL:
+                self.flush_to_disk()
+            self._maybe_compact()
+
+    def flush_to_disk(self) -> None:
+        """Сбрасывает журнал на диск (fsync): записи переживают потерю питания."""
+        with self._lock:
+            self._since_fsync = 0
+            handle = self._handle
+            if handle is None:
+                return
+            with contextlib.suppress(OSError, ValueError):
+                handle.flush()
+                os.fsync(handle.fileno())
+
+    def close(self) -> None:
+        """Сбрасывает и закрывает журнал (вызывается в конце сортировки)."""
+        self.flush_to_disk()
+        with self._lock:
+            self._close_handle()
 
 
 # ── Персистентный лог отмены ───────────────────────────────────────────────────
@@ -987,14 +1129,22 @@ def _undo_log_path(source_dir: Path) -> Path:
 
 
 def _load_undo_log(source_dir: Path) -> list[dict[str, Any]]:
+    """Загружает undo-лог каталога (см. _read_undo_log_file)."""
+    return _read_undo_log_file(_undo_log_path(source_dir))
+
+
+def _read_undo_log_file(path: Path) -> list[dict[str, Any]]:
     """
-    Загружает undo-лог.
+    Читает undo-лог по пути.
 
     Поддерживает два формата для обратной совместимости:
     - Новый JSONL: одна JSON-запись на строку (append-only).
     - Старый JSON-массив: один большой массив объектов.
+
+    Оборванная запись (Ctrl+C прямо во время записи) пропускается — остальные
+    записи журнала остаются читаемыми, поэтому отдельная «двухфазная» запись
+    для каждой операции не нужна.
     """
-    path = _undo_log_path(source_dir)
     if not path.exists():
         return []
     try:
@@ -1030,6 +1180,11 @@ def _load_undo_log(source_dir: Path) -> list[dict[str, Any]]:
 
 
 def _save_undo_log(source_dir: Path, entries: list[dict]) -> None:
+    """Полностью перезаписывает undo-лог каталога (см. _write_undo_log_file)."""
+    _write_undo_log_file(_undo_log_path(source_dir), entries)
+
+
+def _write_undo_log_file(path: Path, entries: list[dict]) -> None:
     """
     Полностью перезаписывает undo-лог в формате JSONL АТОМАРНО.
 
@@ -1037,11 +1192,10 @@ def _save_undo_log(source_dir: Path, entries: list[dict]) -> None:
     атомарная подмена. Прерывание (Ctrl+C, сбой) не оставит половинчатый
     журнал, а параллельный писатель не может затереть записи частично.
 
-    Используется только undo_last_operation для записи оставшихся entries
-    после частичной отмены. Для добавления новых записей используется
-    _UndoLogWriter.append().
+    Используется undo_last_operation (запись оставшихся записей после
+    частичной отмены), компактизацией журнала и очисткой старых бэкапов.
+    Для добавления новых записей служит _UndoLogWriter.append().
     """
-    path = _undo_log_path(source_dir)
     tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -1099,14 +1253,16 @@ def organize_files(
         lock_key = str(source_dir)
     dir_lock = _get_dir_lock(lock_key)
 
-    if not dir_lock.acquire(blocking=False):
+    if not dir_lock.lock.acquire(blocking=False):
         logger.info(
             "organize_files: сортировка этой папки уже выполняется — пропуск "
             "(новые файлы будут обработаны в следующем цикле)."
         )
+        _release_dir_lock(lock_key, dir_lock)
         return {
             "moved": 0, "skipped": 0, "errors": 0,
             "duplicates": 0, "content_duplicates": 0, "empty_dirs_removed": 0,
+            "journal_trimmed": 0, "backups_removed": 0,
             "by_category": {}, "skipped_concurrent": True,
         }
 
@@ -1121,7 +1277,8 @@ def organize_files(
             config=config,
         )
     finally:
-        dir_lock.release()
+        dir_lock.lock.release()
+        _release_dir_lock(lock_key, dir_lock)
 
 
 def _organize_files_impl(
@@ -1150,6 +1307,13 @@ def _organize_files_impl(
     use_dry_run: bool = settings.get("dry_run", False) or dry_run
     clean_empty: bool = settings.get("clean_empty_dirs", True)
     dup_strategy: str = settings.get("duplicate_strategy", "rename")  # rename | skip | replace
+    # Срок хранения бэкапов заменённых файлов (0 = хранить всегда).
+    # Тип и знак проверены схемой конфига (см. _validate_config_schema).
+    backup_retention_days: int = settings.get(
+        "backup_retention_days", DEFAULT_BACKUP_RETENTION_DAYS
+    )
+    # Журнал отмены не должен расти бесконечно (0 = без ограничения)
+    max_undo_entries: int = settings.get("max_undo_entries", DEFAULT_MAX_UNDO_ENTRIES)
     # Дубликаты по содержимому — опция: чтение файлов стоит времени, по умолчанию выключено
     detect_content_dups: bool = bool(settings.get("content_duplicates", False))
 
@@ -1166,6 +1330,7 @@ def _organize_files_impl(
     stats: dict[str, Any] = {
         "moved": 0, "skipped": 0, "errors": 0,
         "duplicates": 0, "content_duplicates": 0, "empty_dirs_removed": 0,
+        "journal_trimmed": 0, "backups_removed": 0,
         "by_category": {},
     }
     session_log: list[dict] = []
@@ -1185,12 +1350,21 @@ def _organize_files_impl(
         log("  ⚠  DRY-RUN — файлы НЕ будут перемещены")
     if detect_content_dups:
         log("  ♻  Дубликаты по содержимому: файлы с уже имеющимся содержимым не переносятся")
+    if backup_retention_days > 0:
+        log(f"  🧹 Бэкапы старше {backup_retention_days} дн. удаляются")
     log(f"{'─'*60}\n")
 
     # lru_cache для _resolve_cached инвалидируем ПЕРЕД сканированием,
     # чтобы не использовать устаревшие записи (файлы могли быть удалены/переименованы
     # между вызовами organize_files в режиме мониторинга).
     _resolve_cached.cache_clear()
+
+    # Очистка старых бэкапов — до сортировки: тогда она выполняется и когда
+    # сортировать уже нечего (иначе уборка никогда бы не запускалась).
+    if backup_retention_days > 0:
+        stats["backups_removed"] = _cleanup_old_backups(
+            source_path, category_names, backup_retention_days, use_dry_run, log
+        )
 
     # ── Сбор файлов через os.scandir() — получаем stat бесплатно ──────────────
     raw_file_stats, scan_errors = _scan_files_fast(source_path, use_recursive)
@@ -1212,6 +1386,12 @@ def _organize_files_impl(
         # Свой пробный файл (проверка регистра ФС) не сортируем даже при
         # ignore_hidden=false: он живёт миллисекунды и не является данными.
         if f.name.startswith(CASE_PROBE_PREFIX):
+            return True
+        # Бэкап заменённого файла (<оригинал>.bak-<время>) — служебный: он должен
+        # лежать рядом с тем файлом, который заменили. Иначе расширение «bak-…»
+        # считалось бы неизвестным и бэкап уезжал в other/, а undo, который ищет
+        # его по пути из журнала, не мог бы вернуть заменённый файл.
+        if _backup_timestamp(f.name) is not None:
             return True
         try:
             rel = f.relative_to(source_path)
@@ -1276,7 +1456,11 @@ def _organize_files_impl(
 
     # Писатель undo-журнала: append-only JSONL, потокобезопасен и не делает
     # read-modify-write всего файла на каждую запись.
-    undo_writer = _UndoLogWriter(_undo_log_path(source_path)) if not use_dry_run else None
+    undo_writer = (
+        _UndoLogWriter(_undo_log_path(source_path), max_entries=max_undo_entries)
+        if not use_dry_run
+        else None
+    )
 
     # M6 fix: вторая половина прогресса — по факту обработки файлов
     handled = 0
@@ -1543,6 +1727,13 @@ def _organize_files_impl(
             except Exception:
                 pass
 
+    # Журнал сбрасываем на диск и закрываем до итога: записи переживают
+    # потерю питания, а число выброшенных компактизацией записей попадает
+    # в статистику.
+    if undo_writer is not None:
+        stats["journal_trimmed"] = undo_writer.trimmed
+        undo_writer.close()
+
     # ── Статистика ─────────────────────────────────────────────────────────────
     log(f"\n{'─'*60}")
     log("  ИТОГО")
@@ -1552,6 +1743,10 @@ def _organize_files_impl(
     log(f"  Дубликаты   : {stats['duplicates']}")
     if detect_content_dups or stats["content_duplicates"]:
         log(f"  ♻ По содержимому: {stats['content_duplicates']}")
+    if stats["journal_trimmed"]:
+        log(f"  🗜 Журнал отмены: удалено старых записей: {stats['journal_trimmed']}")
+    if stats["backups_removed"]:
+        log(f"  🧹 Удалено старых бэкапов: {stats['backups_removed']}")
     log(f"  Ошибки      : {stats['errors']}")
     if use_recursive and not use_dry_run:
         log(f"  Пустых папок удалено: {stats['empty_dirs_removed']}")
@@ -1562,6 +1757,102 @@ def _organize_files_impl(
     log(f"{'─'*60}\n")
 
     return stats
+
+
+# ── Очистка старых бэкапов ─────────────────────────────────────────────────────
+
+def _backup_timestamp(filename: str) -> Optional[datetime]:
+    """
+    Время создания бэкапа из его имени: <оригинал>.bak-ГГГГММДД_ЧЧММСС.
+
+    None — если имя не подходит под формат. Чужие файлы, лишь похожие на
+    бэкапы, не удаляются никогда.
+    """
+    match = _BACKUP_NAME_RE.search(filename)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+
+
+def _drop_backup_journal_entries(
+    source_path: Path, removed_rel: list[str], log: Callable[[str], None]
+) -> None:
+    """Убирает из журнала записи об удалённых бэкапах: восстанавливать нечего."""
+    entries = _load_undo_log(source_path)
+    if not entries:
+        return
+    gone = set(removed_rel)
+    kept = [
+        entry
+        for entry in entries
+        if not (
+            isinstance(entry, dict)
+            and entry.get("action") == "backup"
+            and entry.get("source") in gone
+        )
+    ]
+    if len(kept) != len(entries):
+        _save_undo_log(source_path, kept)
+        log(f"  🗑  Журнал отмены: убрано записей об удалённых бэкапах: {len(entries) - len(kept)}")
+
+
+def _cleanup_old_backups(
+    source_path: Path,
+    category_names: "frozenset[str] | set[str]",
+    retention_days: int,
+    dry_run: bool,
+    log: Callable[[str], None],
+) -> int:
+    """
+    Удаляет устаревшие бэкапы заменённых файлов (`<оригинал>.bak-ГГГГММДД_ЧЧММСС`).
+
+    Бэкапы создаёт стратегия replace, и без очистки они копятся в папках
+    категорий вечно. Возвращает число удалённых файлов.
+
+    Удаляем только строго узнаваемые имена и только старше retention_days.
+    В dry-run ничего не трогаем — сообщаем, что было бы удалено.
+    """
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    removed_rel: list[str] = []
+    removed = 0
+
+    for category in sorted(category_names):
+        cat_dir = source_path / category
+        if not cat_dir.is_dir():
+            continue
+        try:
+            with os.scandir(cat_dir) as it:
+                entries = [e for e in it if e.is_file(follow_symlinks=False)]
+        except OSError:
+            continue
+
+        for entry in entries:
+            stamp = _backup_timestamp(entry.name)
+            if stamp is None or stamp > cutoff:
+                continue
+            backup_path = Path(entry.path)
+            masked = _mask_path_for_log(backup_path, source_path)
+            if dry_run:
+                log(f"  🧹 Старый бэкап будет удалён: {masked}")
+                continue
+            try:
+                backup_path.unlink()
+            except OSError as exc:
+                log(f"  ✗  Не удалось удалить бэкап {masked}: {exc}")
+                continue
+            removed += 1
+            try:
+                removed_rel.append(backup_path.relative_to(source_path).as_posix())
+            except ValueError:
+                removed_rel.append(backup_path.name)
+            log(f"  🧹 Удалён старый бэкап: {masked}")
+
+    if removed_rel:
+        _drop_backup_journal_entries(source_path, removed_rel, log)
+    return removed
 
 
 # ── undo_last_operation ────────────────────────────────────────────────────────
@@ -1593,14 +1884,18 @@ def undo_last_operation(
         lock_key = str(Path(source_dir).resolve())
     except (OSError, ValueError):
         lock_key = str(source_dir)
-    with _get_dir_lock(lock_key):
-        return _undo_last_operation_impl(
-            source_dir=source_dir,
-            count=count,
-            verbose=verbose,
-            log_callback=log_callback,
-            config=config,
-        )
+    dir_lock = _get_dir_lock(lock_key)
+    try:
+        with dir_lock.lock:
+            return _undo_last_operation_impl(
+                source_dir=source_dir,
+                count=count,
+                verbose=verbose,
+                log_callback=log_callback,
+                config=config,
+            )
+    finally:
+        _release_dir_lock(lock_key, dir_lock)
 
 
 def _undo_last_operation_impl(
