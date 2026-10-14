@@ -224,6 +224,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"Дубликатов: {stats['duplicates']}")
             if stats.get('content_duplicates'):
                 print(f"Дубликатов по содержимому: {stats['content_duplicates']}")
+            if stats.get('ignored'):
+                print(f"Исключено по .organizerignore: {stats['ignored']}")
             if stats.get('backups_removed'):
                 # dry-run может прийти и из конфига, и из флага
                 planned = bool(args.dry_run) or bool(

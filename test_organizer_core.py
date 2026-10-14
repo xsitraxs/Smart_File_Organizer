@@ -1147,6 +1147,263 @@ def _read_entries(path: Path) -> list:
     ]
 
 
+class TestOrganizerIgnorePatterns(unittest.TestCase):
+    """Разбор .organizerignore и семантика шаблонов (чистые функции)."""
+
+    def test_comments_and_blank_lines_are_skipped(self):
+        from organizer_core import _parse_ignore_patterns
+
+        patterns = _parse_ignore_patterns("# комментарий\n\n  *.tmp  \n")
+
+        self.assertEqual(patterns, [("*.tmp", False)])
+
+    def test_negation_is_parsed(self):
+        from organizer_core import _parse_ignore_patterns
+
+        self.assertEqual(_parse_ignore_patterns("!keep.tmp"), [("keep.tmp", True)])
+        self.assertEqual(_parse_ignore_patterns("!"), [])
+
+    def test_pattern_semantics(self):
+        """Таблица случаев: имя, путь от корня, каталоги, отрицание."""
+        from organizer_core import _matches_ignore, _parse_ignore_patterns
+
+        patterns = _parse_ignore_patterns(
+            "*.tmp\ndocs/*.pdf\nnode_modules/\nbuild/cache/\n!keep.tmp"
+        )
+        cases = [
+            ("a.tmp", False, True),                 # по имени на любом уровне
+            ("sub/dir/a.tmp", False, True),
+            ("docs/a.pdf", False, True),            # путь от корня
+            ("sub/docs/a.pdf", False, False),
+            ("b.pdf", False, False),
+            ("x/node_modules/lib.js", False, True),  # каталог на любом уровне
+            ("node_modules", True, True),
+            ("build/cache/x.txt", False, True),      # каталог от корня
+            ("other/build/cache/x.txt", False, False),
+            ("keep.tmp", False, False),              # отрицание
+            ("sub/keep.tmp", False, False),
+            ("images/photo.jpg", False, False),
+        ]
+        for rel_path, is_dir, expected in cases:
+            with self.subTest(path=rel_path, is_dir=is_dir):
+                self.assertEqual(
+                    _matches_ignore(rel_path, patterns, is_dir), expected
+                )
+
+    def test_last_matching_pattern_wins(self):
+        from organizer_core import _matches_ignore, _parse_ignore_patterns
+
+        patterns = _parse_ignore_patterns("!keep.tmp\n*.tmp")
+
+        self.assertTrue(_matches_ignore("keep.tmp", patterns, is_dir=False))
+
+
+class TestOrganizerIgnore(unittest.TestCase):
+    """.organizerignore в работе: исключённое не сортируется и не считается отсортированным."""
+
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+
+    def write_ignore(self, *lines: str) -> None:
+        content = "\n".join(lines) + "\n"
+        (self.test_dir / ".organizerignore").write_text(content, encoding="utf-8")
+
+    def write_file(self, relative: str) -> Path:
+        path = self.test_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("data", encoding="utf-8")
+        return path
+
+    def files_in(self, relative: str = "") -> list:
+        directory = self.test_dir / relative if relative else self.test_dir
+        service = {".organizerignore", UNDO_LOG_FILENAME}
+        return sorted(
+            p.name for p in directory.iterdir() if p.is_file() and p.name not in service
+        )
+
+    def organize(self, **kwargs: Any) -> dict:
+        return organize_files(str(self.test_dir), verbose=False, **kwargs)
+
+    def test_extension_pattern_skips_files_anywhere(self):
+        """«*.tmp» действует по имени на любом уровне вложенности."""
+        self.write_ignore("*.tmp")
+        self.write_file("keep.jpg")
+        self.write_file("skip.tmp")
+        self.write_file("nested/also.tmp")
+
+        stats = self.organize()
+
+        self.assertEqual(stats["moved"], 1)
+        self.assertEqual(stats["ignored"], 2)
+        self.assertEqual(self.files_in("nested"), ["also.tmp"])
+
+    def test_path_pattern_from_root(self):
+        """«docs/*.pdf» действует только от корня сортируемой папки."""
+        self.write_ignore("docs/*.pdf")
+        self.write_file("docs/a.pdf")
+        self.write_file("b.pdf")
+
+        stats = self.organize()
+
+        self.assertEqual(stats["ignored"], 1)
+        self.assertTrue((self.test_dir / "docs" / "a.pdf").exists())
+        self.assertIn("b.pdf", self.files_in("documents"))
+
+    def test_dir_pattern_prunes_without_touching_contents(self):
+        """«node_modules/» исключает каталог целиком — внутрь даже не заходим."""
+        self.write_ignore("node_modules/")
+        self.write_file("node_modules/lib/index.js")
+        self.write_file("app.js")
+
+        stats = self.organize()
+
+        self.assertEqual(stats["moved"], 1)
+        # файлы внутри исключённого каталога даже не сканируются → не считаются
+        self.assertEqual(stats["ignored"], 0)
+        self.assertEqual(self.files_in("node_modules/lib"), ["index.js"])
+
+    def test_ignored_empty_dir_is_not_removed(self):
+        """Исключённый каталог не удаляется даже пустым (очистка пустых папок)."""
+        self.write_ignore("node_modules/")
+        (self.test_dir / "node_modules").mkdir()
+        (self.test_dir / "empty_plain").mkdir()
+        self.write_file("a.txt")
+
+        self.organize()
+
+        self.assertTrue((self.test_dir / "node_modules").is_dir())
+        # контроль: обычная пустая папка по-прежнему убирается
+        self.assertFalse((self.test_dir / "empty_plain").exists())
+
+    def test_negation_returns_file_to_sorting(self):
+        """«!keep.tmp» отменяет исключение предыдущего шаблона."""
+        self.write_ignore("*.tmp", "!keep.tmp")
+        self.write_file("keep.tmp")
+        self.write_file("skip.tmp")
+
+        stats = self.organize()
+
+        self.assertEqual(stats["moved"], 1)
+        self.assertFalse((self.test_dir / "keep.tmp").exists())
+        self.assertTrue((self.test_dir / "skip.tmp").exists())
+
+    def test_patterns_apply_inside_category_dirs(self):
+        """Шаблоны работают и внутри папок категорий."""
+        self.write_ignore("*.tmp")
+        self.write_file("images/photo.jpg")
+        self.write_file("images/note.tmp")
+
+        stats = self.organize()
+
+        self.assertEqual(stats["ignored"], 1)
+        self.assertEqual(self.files_in("images"), ["note.tmp", "photo.jpg"])
+        self.assertFalse((self.test_dir / "other").exists())
+
+    def test_ignore_file_is_never_sorted(self):
+        """Даже при ignore_hidden=false сам файл правил остаётся на месте."""
+        self.write_ignore("*.tmp")
+        self.write_file("a.txt")
+        cfg = copy.deepcopy(DEFAULT_CONFIG)
+        cfg["settings"]["ignore_hidden"] = False
+
+        self.organize(config=cfg)
+
+        self.assertTrue((self.test_dir / ".organizerignore").exists())
+        self.assertIn("a.txt", self.files_in("documents"))
+
+    def test_dry_run_changes_nothing(self):
+        """В dry-run исключённые файлы остаются, счётчик считает их как обычно."""
+        self.write_ignore("*.tmp")
+        self.write_file("skip.tmp")
+        self.write_file("keep.jpg")
+
+        stats = self.organize(dry_run=True)
+
+        self.assertEqual(stats["moved"], 1)  # план: keep.jpg → images/
+        self.assertEqual(stats["ignored"], 1)
+        self.assertTrue((self.test_dir / "skip.tmp").exists())
+        self.assertTrue((self.test_dir / "keep.jpg").exists())
+
+    def test_non_recursive_mode_honors_patterns(self):
+        """Без рекурсии шаблоны действуют для файлов корня."""
+        self.write_ignore("*.tmp")
+        self.write_file("skip.tmp")
+        self.write_file("keep.jpg")
+
+        stats = self.organize(recursive=False)
+
+        self.assertEqual(stats["ignored"], 1)
+        self.assertTrue((self.test_dir / "skip.tmp").exists())
+
+    def test_absent_file_means_no_rules(self):
+        """Нет .organizerignore — нет и исключений (поведение по умолчанию)."""
+        self.write_file("a.tmp")
+        self.write_file("b.jpg")
+
+        stats = self.organize()
+
+        self.assertEqual(stats["ignored"], 0)
+        self.assertEqual(stats["moved"], 2)
+
+    def test_nested_ignore_file_is_not_read(self):
+        """Читается только корневой файл правил — вложенные игнорируются."""
+        self.write_file("sub/x.tmp")
+        (self.test_dir / "sub" / ".organizerignore").write_text(
+            "*.tmp\n", encoding="utf-8"
+        )
+
+        stats = self.organize()
+
+        self.assertEqual(stats["moved"], 1)
+        self.assertFalse((self.test_dir / "sub" / "x.tmp").exists())
+
+    def test_directory_instead_of_file_does_not_break_sorting(self):
+        """Каталог с именем .organizerignore не ломает сортировку."""
+        (self.test_dir / ".organizerignore").mkdir()
+        self.write_file("a.txt")
+
+        stats = self.organize()
+
+        self.assertEqual(stats["moved"], 1)
+        self.assertTrue((self.test_dir / "documents" / "a.txt").exists())
+
+    def test_broken_bytes_do_not_break_sorting(self):
+        """Битые байты в файле правил не мешают: валидные строки продолжают работать."""
+        (self.test_dir / ".organizerignore").write_bytes(
+            b"\xff\xfe\x00bad\n*.tmp\n"
+        )
+        self.write_file("a.txt")
+        self.write_file("skip.tmp")
+
+        stats = self.organize()
+
+        self.assertEqual(stats["ignored"], 1)
+        self.assertTrue((self.test_dir / "skip.tmp").exists())
+
+
+class TestOrganizerIgnoreCli(unittest.TestCase):
+    """Итог CLI сообщает, сколько файлов исключено."""
+
+    CLI = str(Path(__file__).parent / "file_organizer.py")
+
+    def test_cli_reports_ignored_count(self):
+        test_dir = Path(tempfile.mkdtemp())
+        (test_dir / ".organizerignore").write_text("*.tmp\n", encoding="utf-8")
+        (test_dir / "a.tmp").write_text("data", encoding="utf-8")
+        (test_dir / "b.jpg").write_text("data", encoding="utf-8")
+
+        r = subprocess.run(
+            [sys.executable, self.CLI, str(test_dir)],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace",
+        )
+
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Исключено по .organizerignore: 1", r.stdout)
+        self.assertTrue((test_dir / "a.tmp").exists())
+        self.assertTrue((test_dir / "images" / "b.jpg").exists())
+
+
 class TestContentDuplicates(unittest.TestCase):
     """Тесты поиска дубликатов по содержимому (settings.content_duplicates).
 
