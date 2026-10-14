@@ -874,7 +874,12 @@ class TestPathLengthGuard(unittest.TestCase):
         long_path = self.test_dir / ("x" * 300)
         with mock.patch.object(oc, "_max_path_length", return_value=10):
             self.assertTrue(oc._path_too_long(long_path))
-        self.assertFalse(oc._path_too_long(long_path))  # без патча — нормально
+
+        # Без патча ответ платформенный: на Windows лимит 259 символов и такой
+        # путь действительно длинный, на macOS (1024) и Linux (нет лимита) — нет.
+        limit = oc._max_path_length()
+        expected = limit is not None and len(str(long_path)) > limit
+        self.assertEqual(oc._path_too_long(long_path), expected)
 
     def test_organize_skips_too_long_paths_without_data_loss(self):
         """Файлы с превышением лимита не перемещаются и не теряются."""
@@ -903,9 +908,12 @@ class TestEncodingSafeStream(unittest.TestCase):
 
     @staticmethod
     def _narrow_stream() -> tuple:
-        """TextIOWrapper в cp1252 — как консоль Windows по умолчанию."""
+        """TextIOWrapper в cp1252 — как консоль Windows по умолчанию.
+
+        newline="" — иначе Windows-версия TextIOWrapper сам переводит \n в \r\n.
+        """
         buf = io_mod.BytesIO()
-        return io_mod.TextIOWrapper(buf, encoding="cp1252"), buf
+        return io_mod.TextIOWrapper(buf, encoding="cp1252", newline=""), buf
 
     def test_cyrillic_does_not_crash_narrow_stream(self):
         """Печать кириллицы в cp1252 не падает с UnicodeEncodeError."""
@@ -943,7 +951,7 @@ class TestEncodingSafeStream(unittest.TestCase):
         from organizer_core import _EncodingSafeStream
 
         buf = io_mod.BytesIO()
-        wide = io_mod.TextIOWrapper(buf, encoding="utf-8")
+        wide = io_mod.TextIOWrapper(buf, encoding="utf-8", newline="")
         safe = _EncodingSafeStream(wide)
         safe.write("Перемещено: 2\n")
         safe.flush()
@@ -1788,8 +1796,11 @@ class TestProtectedDirResolution(unittest.TestCase):
             except (OSError, NotImplementedError):
                 self.skipTest("симлинки недоступны на этой системе")
 
-            with mock.patch.object(oc, "_PROTECTED_EXACT", {real}), \
-                    mock.patch.object(oc, "_PROTECTED_TREES", {real}), \
+            # resolve()-форма: на macOS /var → /private/var, на Windows temp
+            # может отдаваться коротким именем 8.3 — сравнение идёт по ней.
+            real_resolved = real.resolve()
+            with mock.patch.object(oc, "_PROTECTED_EXACT", {real_resolved}), \
+                    mock.patch.object(oc, "_PROTECTED_TREES", {real_resolved}), \
                     mock.patch.object(oc, "_USER_TEMP_TREES", set()):
                 self.assertTrue(oc.is_protected_dir(link))
                 self.assertTrue(oc.is_protected_dir(real / "passwd"))
@@ -1807,6 +1818,8 @@ class TestProtectedDirResolution(unittest.TestCase):
 
         import organizer_core as oc
 
+        if os.name == "nt":
+            self.skipTest("Пути /private/var — только POSIX (macOS)")
         fake_temp = Path("/private/var/folders/zz/T/tmp123")  # не создаём
         with mock.patch.object(oc, "_PROTECTED_TREES", {Path("/private/var")}):
             self.assertTrue(oc.is_protected_dir(Path("/private/var/log")))
@@ -2196,9 +2209,15 @@ class TestLogPathMasking(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             masked = _mask_dir_for_log(root)
-            # Полный путь в лог не попадает: вне домашней папки — только имя
+            # Абсолютный путь (с именем пользователя) в лог не попадает
             self.assertNotEqual(masked, str(root))
-            self.assertEqual(masked, root.name)
+            if masked.startswith("~"):
+                # Windows: temp лежит внутри домашней папки → сокращается до ~/...
+                self.assertTrue(masked.startswith("~/") or masked.startswith("~\\"))
+                self.assertNotIn(Path.home().name, masked.split("\\")[0] + "/")
+            else:
+                # Вне домашней папки (Linux/macOS) — только имя каталога
+                self.assertEqual(masked, root.name)
 
     def test_file_path_masked_relative(self):
         """Путь файла в логе — относительный внутри рабочей папки (M11)."""

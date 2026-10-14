@@ -495,10 +495,22 @@ def _validate_path_safety(file_path: Path, source_dir: Path) -> bool:
 
 
 def _mask_path_for_log(path: Path, source_dir: Path) -> str:
-    """Маскирует полный путь в логах для предотвращения утечки информации."""
+    """
+    Маскирует полный путь в логах для предотвращения утечки информации.
+
+    Возвращает путь относительно рабочей директории в POSIX-виде (одинаково
+    читается в логах на любой ОС). Сравнение идёт по resolve()-формам: на macOS
+    /var — симлинк в /private/var, а Windows отдаёт в TMP короткое имя 8.3,
+    поэтому неразрешённый путь не совпадал с разрешённой рабочей папкой и
+    маскировка вырождалась в одно имя файла.
+    """
     try:
-        rel = path.relative_to(_resolve_cached(source_dir))
-        return str(rel)
+        source_resolved = _resolve_cached(source_dir)
+        try:
+            rel = path.relative_to(source_resolved)
+        except ValueError:
+            rel = path.resolve().relative_to(source_resolved)
+        return rel.as_posix()
     except (ValueError, OSError):
         return path.name
 
